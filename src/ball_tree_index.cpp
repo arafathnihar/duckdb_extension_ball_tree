@@ -375,7 +375,7 @@ idx_t BallTreeIndex::TryDelete(IndexLock &lock, DataChunk &entries, Vector &row_
 	return entries.size();
 }
 
-void BallTreeIndex::CommitDrop(IndexLock &index_lock) {
+void BallTreeIndex::ResetStorage(IndexLock &index_lock) {
 	lock_guard<mutex> guard(data_lock_);
 	tree_ = std::make_shared<const BallTreeSnapshot>();
 	added_.clear();

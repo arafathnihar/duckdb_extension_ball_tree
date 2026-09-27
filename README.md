@@ -264,7 +264,7 @@ The test harness checkpoints after every commit; the index tests turn that off (
 ./build/release/duckdb mydb.duckdb
 ```
 
-The extension is statically linked into that shell. To load it into another DuckDB build, use `LOAD 'path/to/ball_tree.duckdb_extension'` (an unsigned extension needs `-unsigned` or `allow_unsigned_extensions`, and the DuckDB version must match the one it was built against, v1.5.4).
+The extension is statically linked into that shell. To load it into another DuckDB build, use `LOAD 'path/to/ball_tree.duckdb_extension'` (an unsigned extension needs `-unsigned` or `allow_unsigned_extensions`, and the DuckDB version must match the one it was built against, v1.5.5).
 
 ## Publishing as a community extension
 

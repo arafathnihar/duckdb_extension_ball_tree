@@ -97,7 +97,7 @@ public:
 	idx_t TryDelete(IndexLock &lock, DataChunk &entries, Vector &row_identifiers,
 	                optional_ptr<SelectionVector> deleted_sel = nullptr,
 	                optional_ptr<SelectionVector> non_deleted_sel = nullptr) override;
-	void CommitDrop(IndexLock &index_lock) override;
+	void ResetStorage(IndexLock &index_lock) override;
 	bool MergeIndexes(IndexLock &state, BoundIndex &other_index) override;
 	void Vacuum(IndexLock &state) override;
 	idx_t GetInMemorySize(IndexLock &state) override;
