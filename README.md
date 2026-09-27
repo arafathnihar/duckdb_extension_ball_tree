@@ -271,7 +271,7 @@ The extension is statically linked into that shell. To load it into another Duck
 This repository follows [duckdb/extension-template](https://github.com/duckdb/extension-template), so it builds with DuckDB's CI toolchain (`.github/workflows/MainDistributionPipeline.yml`). To publish it as a [community extension](https://duckdb.org/community_extensions/development):
 
 1. Push this repository to a public GitHub repo and check that the *Main Extension Distribution Pipeline* workflow passes.
-2. In `description.yml`, set `COMMIT_SHA` with the commit to build.
+2. In `description.yml`, set `ref` (`COMMIT_SHA`) to the commit to build.
 3. Fork [duckdb/community-extensions](https://github.com/duckdb/community-extensions), copy the file to `extensions/ball_tree/description.yml`, and open a pull request.
 
 Once merged, anyone can run:
