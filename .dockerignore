@@ -1,6 +1,0 @@
-build
-.cache
-.git
-bench
-*.db
-*.wal

@@ -160,16 +160,6 @@ public:
 	const double *Point(int64_t i) const {
 		return &data_[static_cast<size_t>(i) * DIM];
 	}
-	// Point ids in tree order. Neighbouring entries are spatially close, so iterating
-	// queries in this order is much more cache friendly than input order.
-	const std::vector<int64_t> &TreeOrder() const {
-		return idx_array_;
-	}
-
-	// Number of points within angular distance `r` of `pt` (includes the point itself if it is in the tree).
-	int64_t CountRadius(const double *pt, double r) const {
-		return CountRadiusNode(0, pt, r, Haversine::DistToRDist(r));
-	}
 
 	// Ids of all points within angular distance `r` of `pt`, unsorted. If `dists` is
 	// non-null it receives the matching angular distances.

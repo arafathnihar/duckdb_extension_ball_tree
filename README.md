@@ -197,9 +197,7 @@ SELECT * FROM ball_degree('pts', 'id', 'latitude', 'longitude', 50) ORDER BY deg
 
 ## Performance
 
-`bench/` (`bench.py`, `plot.py`, `results.csv`, `benchmark.png`) measures three things on an Intel i7-12700 (20 threads), median of 5 runs. Every method returns the same matches. The 1M-point table is the real points resampled with about 1 km of jitter.
-
-![benchmark](bench/benchmark.png)
+Measured on an Intel i7-12700 (20 threads), median of 5 runs, on 99,907 real points (and, for the larger tables, those points resampled with about 1 km of jitter). Every method returns the same matches.
 
 **Neighbour count of every point** (99,907 points):
 
@@ -249,42 +247,6 @@ Outputs:
 ./build/release/test/unittest
 ./build/release/extension/ball_tree/ball_tree.duckdb_extension
 ```
-
-### Using the build as your everyday `duckdb`
-
-`build/release/duckdb` is a complete DuckDB shell with `ball_tree` built in, so `~/.local/bin/duckdb` can simply link to it. Build it with the script, not a plain `make release`:
-
-```sh
-./scripts/build_local.sh
-ln -sfn $PWD/build/release/duckdb ~/.local/bin/duckdb
-```
-
-The extension template's Makefile switches off extension autoloading, and a plain build also lacks `autocomplete`, `icu` and `json`, which the stock CLI bundles. The script adds those (`extension_config_local.cmake`) and turns autoloading back on, so `read_csv('https://...')` loads `httpfs` on demand as usual. The link breaks if `build/` is deleted.
-
-### Docker
-
-Two Dockerfiles build the shell from this repository (v1.5.4, with `ball_tree`, `parquet`, `json`, `icu` and `autocomplete` built in):
-
-| | `Dockerfile` | `Dockerfile.https` |
-|---|---|---|
-| Image size | about 51 MB | about 81 MB |
-| Runtime base | `scratch` (only the binary) | `distroless/base-debian12` |
-| Reads `https://` / `s3://` files | no | yes (`httpfs` built in) |
-| Build time (20 cores) | about 4 minutes | about 8 minutes (vcpkg builds OpenSSL and libcurl) |
-
-```sh
-docker build -t duckdb-ball-tree .                                   # or:
-docker build -f Dockerfile.https -t duckdb-ball-tree:https .
-
-docker run --rm -v "$PWD":/data duckdb-ball-tree /data/my.duckdb -c "SELECT ..."
-echo "SELECT 42" | docker run --rm -i duckdb-ball-tree
-```
-
-Neither image can load extensions at runtime, so only what is built in is available. The `scratch` image is a fully static binary, which cannot `dlopen`. `Dockerfile.https` is dynamic against glibc 2.36 (built on Debian 12) with libstdc++ and OpenSSL linked in statically, and needs no network except for the files you read. TLS certificates are verified (an expired certificate is refused).
-
-Tested in both: multithreaded queries, an index persisted across two separate containers, and spilling a large sort to `/tmp`. Tested in `Dockerfile.https`: `https://` CSV and parquet reads.
-
-Two build details, in case you adapt them: `httpfs` is not in DuckDB's source tree, so `extension_config_https.cmake` declares it with the git tag DuckDB v1.5.4 pins; and the vcpkg clone must not be shallow, because the dependency manifest pins a baseline commit that vcpkg looks up in the history.
 
 ## Testing
 
