@@ -11,10 +11,10 @@ extension:
   license: MIT
   excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads"
   maintainers:
-    - GITHUB_USER
+    - arafathnihar
 
 repo:
-  github: GITHUB_USER/duckdb_extension_ball_tree
+  github: arafathnihar/duckdb_extension_ball_tree
   ref: COMMIT_SHA
 
 docs:
