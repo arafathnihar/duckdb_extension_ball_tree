@@ -50,12 +50,10 @@ BallTreeIndex &FindBoundIndex(ClientContext &context, IndexCatalogEntry &index_e
 BallTreeIndex &FindIndex(ClientContext &context, const string &index_name) {
 	auto qname = QualifiedName::Parse(index_name);
 	Binder::BindSchemaOrCatalog(context, qname.catalog, qname.schema);
-	auto &index_entry =
-	    Catalog::GetEntry(context, CatalogType::INDEX_ENTRY, qname.catalog, qname.schema, qname.name)
-	        .Cast<IndexCatalogEntry>();
+	auto &index_entry = Catalog::GetEntry(context, CatalogType::INDEX_ENTRY, qname.catalog, qname.schema, qname.name)
+	                        .Cast<IndexCatalogEntry>();
 	if (index_entry.index_type != BallTreeIndex::TYPE_NAME) {
-		throw BinderException("Index \"%s\" is a %s index, not a BALL_TREE index", index_name,
-		                      index_entry.index_type);
+		throw BinderException("Index \"%s\" is a %s index, not a BALL_TREE index", index_name, index_entry.index_type);
 	}
 	return FindBoundIndex(context, index_entry);
 }
@@ -278,8 +276,8 @@ void DistanceScan(ClientContext &, TableFunctionInput &input, DataChunk &output)
 
 unique_ptr<FunctionData> InfoBind(ClientContext &context, TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types, vector<string> &names) {
-	names = {"index_name",      "table_name", "tree_points", "pending_inserts", "pending_deletes",
-	         "stale",           "rebuilds",   "leaf_size",   "memory_bytes"};
+	names = {"index_name", "table_name", "tree_points", "pending_inserts", "pending_deletes",
+	         "stale",      "rebuilds",   "leaf_size",   "memory_bytes"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
 	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN,
 	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT};

@@ -33,7 +33,7 @@ using balltree::EARTH_RADIUS_KM;
 // ("rebuild on demand"), so there is nothing to keep in sync with the table.
 struct PointSet {
 	vector<int64_t> ids;
-	vector<double> coords; // [lat, lon] in radians, row-major
+	vector<double> coords;                // [lat, lon] in radians, row-major
 	unordered_map<int64_t, idx_t> row_of; // id -> first row with that id
 };
 
@@ -149,8 +149,8 @@ struct TableQueryBindData : public FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &o = other_p.Cast<TableQueryBindData>();
 		return kind == o.kind && table == o.table && id_col == o.id_col && lat_col == o.lat_col &&
-		       lon_col == o.lon_col && leaf_size == o.leaf_size && query_id == o.query_id &&
-		       radius_km == o.radius_km && k == o.k;
+		       lon_col == o.lon_col && leaf_size == o.leaf_size && query_id == o.query_id && radius_km == o.radius_km &&
+		       k == o.k;
 	}
 };
 

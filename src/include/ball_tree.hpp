@@ -333,7 +333,8 @@ private:
 		const size_t dim = SplitDim(idx_start, idx_end);
 		const size_t n_mid = n / 2;
 		std::nth_element(idx_array_.begin() + idx_start, idx_array_.begin() + idx_start + n_mid,
-		                 idx_array_.begin() + idx_end, [&](int64_t a, int64_t b) { return Point(a)[dim] < Point(b)[dim]; });
+		                 idx_array_.begin() + idx_end,
+		                 [&](int64_t a, int64_t b) { return Point(a)[dim] < Point(b)[dim]; });
 		Build(2 * i_node + 1, idx_start, idx_start + n_mid);
 		Build(2 * i_node + 2, idx_start + n_mid, idx_end);
 	}

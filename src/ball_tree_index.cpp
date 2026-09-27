@@ -228,7 +228,7 @@ void BallTreeIndex::ExtractPoints(DataChunk &keys, Vector &row_ids, vector<BallT
 //===--------------------------------------------------------------------===//
 
 std::shared_ptr<const BallTreeSnapshot> BallTreeIndex::BuildSnapshot(vector<double> &coords,
-                                                                    vector<row_t> &&row_ids) const {
+                                                                     vector<row_t> &&row_ids) const {
 	auto snapshot = std::make_shared<BallTreeSnapshot>();
 	if (!row_ids.empty()) {
 		snapshot->tree = make_uniq<BallTree>(coords.data(), row_ids.size(), leaf_size_);
@@ -335,8 +335,7 @@ BallTreeIndexStats BallTreeIndex::GetStats() {
 	stats.stale = IsStaleLocked();
 	stats.rebuilds = rebuilds_;
 	stats.leaf_size = leaf_size_;
-	stats.memory_bytes = (tree_->tree ? tree_->tree->MemoryUsage() : 0) +
-	                     tree_->row_ids.size() * sizeof(row_t) * 2 +
+	stats.memory_bytes = (tree_->tree ? tree_->tree->MemoryUsage() : 0) + tree_->row_ids.size() * sizeof(row_t) * 2 +
 	                     added_.size() * (sizeof(row_t) + sizeof(Coord)) + deleted_.size() * sizeof(row_t);
 	return stats;
 }
@@ -483,7 +482,8 @@ void BallTreeIndex::LoadFromStorage() {
 	snapshot->row_ids.resize(count);
 	std::memcpy(snapshot->row_ids.data(), blob.data() + 24, rows_bytes);
 	try {
-		snapshot->tree = make_uniq<BallTree>(BallTree::Deserialize(blob.data() + 24 + rows_bytes, length - 24 - rows_bytes));
+		snapshot->tree =
+		    make_uniq<BallTree>(BallTree::Deserialize(blob.data() + 24 + rows_bytes, length - 24 - rows_bytes));
 	} catch (std::runtime_error &error) {
 		throw IOException("BALL_TREE index '%s' is corrupt: %s", name, error.what());
 	}
@@ -566,9 +566,9 @@ unique_ptr<IndexBuildBindData> BuildBind(IndexBuildBindInput &input) {
 unique_ptr<IndexBuildGlobalState> BuildGlobalInit(IndexBuildInitGlobalStateInput &input) {
 	auto state = make_uniq<BuildGlobalState>();
 	auto &storage = input.table.GetStorage();
-	state->index = make_uniq<BallTreeIndex>(input.info.index_name, input.info.constraint_type, input.storage_ids,
-	                                        TableIOManager::Get(storage), input.expressions, storage.db,
-	                                        input.info.options);
+	state->index =
+	    make_uniq<BallTreeIndex>(input.info.index_name, input.info.constraint_type, input.storage_ids,
+	                             TableIOManager::Get(storage), input.expressions, storage.db, input.info.options);
 	return std::move(state);
 }
 
