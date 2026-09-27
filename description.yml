@@ -1,0 +1,44 @@
+# Descriptor for the DuckDB community extensions repository.
+# To publish, copy this file to extensions/ball_tree/description.yml in a fork of
+# https://github.com/duckdb/community-extensions and open a pull request.
+# Before that, fill in repo.github and set repo.ref to the commit you want built.
+extension:
+  name: ball_tree
+  description: Great-circle (haversine) radius and k-nearest-neighbour queries over latitude/longitude points, with a persistent BALL_TREE index.
+  version: 0.1.0
+  language: C++
+  build: cmake
+  license: MIT
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads"
+  maintainers:
+    - GITHUB_USER
+
+repo:
+  github: GITHUB_USER/duckdb_extension_ball_tree
+  ref: COMMIT_SHA
+
+docs:
+  hello_world: |
+    CREATE TABLE pts AS
+      SELECT i AS id, 40 + random() AS latitude, -74 + random() AS longitude
+      FROM range(10000) t(i);
+    CREATE INDEX pts_idx ON pts USING BALL_TREE (latitude, longitude);
+
+    -- everything within 5 km of a location, nearest first
+    SELECT p.id, w.distance_km
+    FROM ball_index_within('pts_idx', 40.5, -73.5, 5) w
+    JOIN pts p ON p.rowid = w.row_id;
+
+    -- the 3 nearest points
+    SELECT p.id, w.distance_km
+    FROM ball_index_nearest('pts_idx', 40.5, -73.5, 3) w
+    JOIN pts p ON p.rowid = w.row_id;
+  extended_description: |
+    `ball_tree` adds a `BALL_TREE` index type over a (latitude, longitude) pair in degrees, and table
+    functions that query it: `ball_index_within`, `ball_index_nearest`, `ball_index_degree` and
+    `ball_index_info`. The index is persisted in the database file and follows inserts, updates and
+    deletes (a change marks it stale; the next query rebuilds it). For one-off use, `ball_within`,
+    `ball_nearest` and `ball_degree` work straight from a table without an index.
+
+    The tree is a C++ port of scikit-learn's BallTree specialised to the haversine metric.
+    Distances are in kilometres. See the repository README for details and benchmarks.

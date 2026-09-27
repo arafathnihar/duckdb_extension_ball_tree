@@ -1,0 +1,536 @@
+# name: test/sql/ball_tree_index.test
+# description: BALL_TREE index: queries, invalidation, persistence and recovery
+# group: [sql]
+
+load __TEST_DIR__/ball_tree_index.db
+
+require ball_tree
+
+# The test harness checkpoints after every commit by default, which would fold pending changes into the tree
+# immediately. Turn that off wherever the tests observe a stale index.
+statement ok
+PRAGMA wal_autocheckpoint='1TB';
+
+# Points on the equator are 111.195 km apart per degree of longitude; id 4 is far away.
+statement ok
+CREATE TABLE t (id INTEGER, name VARCHAR, lat DOUBLE, lon DOUBLE);
+
+statement ok
+INSERT INTO t VALUES (1, 'a', 0, 0), (2, 'b', 0, 1), (3, 'c', 0, 2), (4, 'd', 10, 10);
+
+statement ok
+CREATE INDEX t_idx ON t USING BALL_TREE (lat, lon);
+
+#===----------------------------------------------------------------------===#
+# Queries
+#===----------------------------------------------------------------------===#
+
+# ball_index_info reports the index and that it is fresh
+query IIIIII
+SELECT index_name, table_name, tree_points, pending_inserts, pending_deletes, stale FROM ball_index_info();
+----
+t_idx	t	4	0	0	false
+
+# within a radius, nearest first; join back to the table through the row id
+query II
+SELECT t.id, round(w.distance_km, 1) FROM ball_index_within('t_idx', 0, 0, 250) w JOIN t ON t.rowid = w.row_id ORDER BY w.distance_km, t.id;
+----
+1	0.0
+2	111.2
+3	222.4
+
+query II
+SELECT t.id, round(w.distance_km, 1) FROM ball_index_nearest('t_idx', 0, 1.9, 2) w JOIN t ON t.rowid = w.row_id ORDER BY w.distance_km, t.id;
+----
+3	11.1
+2	100.1
+
+# k larger than the number of points returns all of them
+query I
+SELECT count(*) FROM ball_index_nearest('t_idx', 0, 0, 100);
+----
+4
+
+# a radius that matches nothing
+query I
+SELECT count(*) FROM ball_index_within('t_idx', -50, 100, 10);
+----
+0
+
+# degree: how many other indexed points are within the radius of each point
+query II
+SELECT t.id, d.degree FROM ball_index_degree('t_idx', 120) d JOIN t ON t.rowid = d.row_id ORDER BY t.id;
+----
+1	1
+2	2
+3	1
+4	0
+
+# the point with the most neighbours
+query II
+SELECT t.id, d.degree FROM ball_index_degree('t_idx', 250) d JOIN t ON t.rowid = d.row_id ORDER BY d.degree DESC, t.id LIMIT 1;
+----
+1	2
+
+#===----------------------------------------------------------------------===#
+# Invalidation: only changes to the indexed data make the index stale
+#===----------------------------------------------------------------------===#
+
+# updating a column that is not indexed does not touch the index
+statement ok
+UPDATE t SET name = 'zz' WHERE id = 1;
+
+query IIII
+SELECT stale, tree_points, pending_inserts, pending_deletes FROM ball_index_info();
+----
+false	4	0	0
+
+# a row without coordinates is not indexed, so adding one changes nothing
+statement ok
+INSERT INTO t VALUES (9, 'nocoords', NULL, NULL);
+
+query IIII
+SELECT stale, tree_points, pending_inserts, pending_deletes FROM ball_index_info();
+----
+false	4	0	0
+
+# a new row with coordinates makes the index stale
+statement ok
+INSERT INTO t VALUES (5, 'e', 0, 3);
+
+query IIII
+SELECT stale, tree_points, pending_inserts, pending_deletes FROM ball_index_info();
+----
+true	4	1	0
+
+# the next query folds the change in with one rebuild, and sees the new row
+query I
+SELECT count(*) FROM ball_index_within('t_idx', 0, 0, 400);
+----
+4
+
+query IIIII
+SELECT stale, tree_points, pending_inserts, pending_deletes, rebuilds FROM ball_index_info();
+----
+false	5	0	0	1
+
+# a query on a fresh index does not rebuild it again
+query I
+SELECT count(*) FROM ball_index_within('t_idx', 0, 0, 400);
+----
+4
+
+query I
+SELECT rebuilds FROM ball_index_info();
+----
+1
+
+# deleting an indexed row makes it stale
+statement ok
+DELETE FROM t WHERE id = 3;
+
+query IIII
+SELECT stale, tree_points, pending_inserts, pending_deletes FROM ball_index_info();
+----
+true	5	0	1
+
+# updating a coordinate is a delete plus an insert
+statement ok
+UPDATE t SET lon = 5 WHERE id = 2;
+
+query IIII
+SELECT stale, tree_points, pending_inserts, pending_deletes FROM ball_index_info();
+----
+true	5	1	2
+
+# every change is reflected after the rebuild: id 3 gone, id 2 moved to lon 5, id 5 added
+query II
+SELECT t.id, round(w.distance_km, 1) FROM ball_index_within('t_idx', 0, 0, 1000) w JOIN t ON t.rowid = w.row_id ORDER BY w.distance_km, t.id;
+----
+1	0.0
+5	333.6
+2	556.0
+
+query III
+SELECT stale, tree_points, rebuilds FROM ball_index_info();
+----
+false	4	2
+
+# a rolled back transaction leaves the index untouched
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO t VALUES (6, 'f', 1, 1);
+
+statement ok
+ROLLBACK;
+
+query III
+SELECT stale, pending_inserts, pending_deletes FROM ball_index_info();
+----
+false	0	0
+
+# rows inserted in a transaction reach the index at commit, not before
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO t VALUES (7, 'g', 30, 30);
+
+query I
+SELECT count(*) FROM ball_index_within('t_idx', 30, 30, 1);
+----
+0
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM ball_index_within('t_idx', 30, 30, 1);
+----
+1
+
+#===----------------------------------------------------------------------===#
+# Persistence: the tree is stored in the database file and loaded without a rebuild
+#===----------------------------------------------------------------------===#
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query IIIIII
+SELECT index_name, tree_points, pending_inserts, pending_deletes, stale, rebuilds FROM ball_index_info();
+----
+t_idx	5	0	0	false	0
+
+query II
+SELECT t.id, round(w.distance_km, 1) FROM ball_index_within('t_idx', 0, 0, 1000) w JOIN t ON t.rowid = w.row_id ORDER BY w.distance_km, t.id;
+----
+1	0.0
+5	333.6
+2	556.0
+
+# nothing above needed a rebuild
+query I
+SELECT rebuilds FROM ball_index_info();
+----
+0
+
+#===----------------------------------------------------------------------===#
+# Recovery from the write-ahead log: changes made after the last checkpoint
+#===----------------------------------------------------------------------===#
+
+statement ok
+PRAGMA wal_autocheckpoint='1TB';
+
+statement ok
+PRAGMA disable_checkpoint_on_shutdown;
+
+statement ok
+INSERT INTO t VALUES (8, 'h', 0, 4);
+
+statement ok
+DELETE FROM t WHERE id = 5;
+
+statement ok
+UPDATE t SET lat = 0, lon = 6 WHERE id = 7;
+
+restart
+
+# the replayed changes make the loaded index stale ...
+query IIII
+SELECT stale, tree_points, pending_inserts, pending_deletes FROM ball_index_info();
+----
+true	5	2	2
+
+# ... and the next query rebuilds it from them
+query II
+SELECT t.id, round(w.distance_km, 1) FROM ball_index_within('t_idx', 0, 0, 1000) w JOIN t ON t.rowid = w.row_id ORDER BY w.distance_km, t.id;
+----
+1	0.0
+8	444.8
+2	556.0
+7	667.2
+
+query II
+SELECT stale, tree_points FROM ball_index_info();
+----
+false	5
+
+# an index created after the last checkpoint is recovered from the log too
+statement ok
+PRAGMA wal_autocheckpoint='1TB';
+
+statement ok
+PRAGMA disable_checkpoint_on_shutdown;
+
+statement ok
+CREATE TABLE u (lat DOUBLE, lon DOUBLE);
+
+statement ok
+INSERT INTO u VALUES (0, 0), (0, 1), (0, 2);
+
+statement ok
+CREATE INDEX u_idx ON u USING BALL_TREE (lat, lon) WITH (leaf_size = 2);
+
+restart
+
+query III
+SELECT index_name, tree_points, leaf_size FROM ball_index_info() WHERE index_name = 'u_idx';
+----
+u_idx	3	2
+
+query I
+SELECT count(*) FROM ball_index_within('u_idx', 0, 0, 150);
+----
+2
+
+# a checkpoint after changes stores the rebuilt tree: fresh and no rebuild after the next restart
+statement ok
+INSERT INTO u VALUES (0, 3);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query IIII
+SELECT stale, tree_points, pending_inserts, rebuilds FROM ball_index_info() WHERE index_name = 'u_idx';
+----
+false	4	0	0
+
+#===----------------------------------------------------------------------===#
+# Table lifecycle
+#===----------------------------------------------------------------------===#
+
+# DELETE without a WHERE clause empties the index
+statement ok
+DELETE FROM u;
+
+query I
+SELECT count(*) FROM ball_index_degree('u_idx', 1000);
+----
+0
+
+statement ok
+INSERT INTO u VALUES (5, 5);
+
+query I
+SELECT count(*) FROM ball_index_degree('u_idx', 1000);
+----
+1
+
+# an index on an empty table, FLOAT columns
+statement ok
+CREATE TABLE f (lat FLOAT, lon FLOAT);
+
+statement ok
+CREATE INDEX f_idx ON f USING BALL_TREE (lat, lon);
+
+query I
+SELECT count(*) FROM ball_index_within('f_idx', 0, 0, 100);
+----
+0
+
+statement ok
+INSERT INTO f VALUES (0, 0), (0, 1);
+
+query I
+SELECT count(*) FROM ball_index_within('f_idx', 0, 0, 200);
+----
+2
+
+# a large batch in one statement
+statement ok
+CREATE TABLE big AS SELECT i AS id, ((i % 170) - 85)::DOUBLE AS lat, ((i % 350) - 175)::DOUBLE AS lon FROM range(200000) t(i);
+
+statement ok
+CREATE INDEX big_idx ON big USING BALL_TREE (lat, lon);
+
+statement ok
+INSERT INTO big SELECT i + 200000, ((i % 170) - 85)::DOUBLE, ((i % 350) - 175)::DOUBLE FROM range(200000) t(i);
+
+query I
+SELECT count(*) FROM ball_index_degree('big_idx', 1);
+----
+400000
+
+# ... and it agrees with a brute-force count for one point
+query I
+SELECT (SELECT count(*) FROM ball_index_within('big_idx', 0, 0, 500)) = (SELECT count(*) FROM big WHERE 2 * 6371.0088 * asin(sqrt(sin(radians(lat) / 2) ^ 2 + cos(radians(lat)) * sin(radians(lon) / 2) ^ 2)) <= 500);
+----
+true
+
+# DECIMAL coordinates: cast them in the index expressions
+statement ok
+CREATE TABLE d (id INTEGER, lat DECIMAL(9, 6), lon DECIMAL(9, 6));
+
+statement ok
+INSERT INTO d VALUES (1, 0.000000, 0.000000), (2, 0.000000, 1.000000), (3, 45.500000, 45.500000);
+
+statement error
+CREATE INDEX d_bad ON d USING BALL_TREE (lat, lon);
+----
+must be DOUBLE or FLOAT
+
+statement ok
+CREATE INDEX d_idx ON d USING BALL_TREE ((lat::DOUBLE), (lon::DOUBLE));
+
+query II
+SELECT d.id, round(w.distance_km, 1) FROM ball_index_within('d_idx', 0, 0, 200) w JOIN d ON d.rowid = w.row_id ORDER BY w.distance_km, d.id;
+----
+1	0.0
+2	111.2
+
+statement ok
+INSERT INTO d VALUES (4, 0.000000, 0.500000);
+
+statement ok
+UPDATE d SET lon = 1.500000 WHERE id = 2;
+
+query II
+SELECT d.id, round(w.distance_km, 1) FROM ball_index_within('d_idx', 0, 0, 200) w JOIN d ON d.rowid = w.row_id ORDER BY w.distance_km, d.id;
+----
+1	0.0
+4	55.6
+2	166.8
+
+# dropping the index and the table
+statement ok
+DROP INDEX f_idx;
+
+query I
+SELECT count(*) FROM ball_index_info() WHERE index_name = 'f_idx';
+----
+0
+
+statement ok
+CREATE INDEX f_idx ON f USING BALL_TREE (lat, lon);
+
+statement ok
+DROP TABLE f;
+
+query I
+SELECT count(*) FROM ball_index_info() WHERE index_name = 'f_idx';
+----
+0
+
+#===----------------------------------------------------------------------===#
+# Prepared statements execute against the index as it is now, not as it was when they were prepared
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE pp (lat DOUBLE, lon DOUBLE);
+
+statement ok
+INSERT INTO pp VALUES (0, 0), (0, 1);
+
+statement ok
+CREATE INDEX pp_idx ON pp USING BALL_TREE (lat, lon);
+
+statement ok
+PREPARE pq AS SELECT count(*) FROM ball_index_within('pp_idx', 0, 0, 500);
+
+query I
+EXECUTE pq;
+----
+2
+
+statement ok
+INSERT INTO pp VALUES (0, 2);
+
+query I
+EXECUTE pq;
+----
+3
+
+statement ok
+DELETE FROM pp WHERE lon = 0;
+
+query I
+EXECUTE pq;
+----
+2
+
+#===----------------------------------------------------------------------===#
+# Errors
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE w (a INTEGER, c DOUBLE);
+
+statement error
+CREATE INDEX w1 ON w USING BALL_TREE (a, c);
+----
+BALL_TREE index columns must be DOUBLE or FLOAT
+
+statement error
+CREATE INDEX w2 ON w USING BALL_TREE (c);
+----
+exactly two columns
+
+statement error
+CREATE INDEX w3 ON w USING BALL_TREE (c, c) WITH (foo = 1);
+----
+Unknown option for BALL_TREE index
+
+statement error
+CREATE INDEX w4 ON w USING BALL_TREE (c, c) WITH (leaf_size = 0);
+----
+'leaf_size' must be at least 1
+
+statement error
+CREATE UNIQUE INDEX w5 ON w USING BALL_TREE (c, c);
+----
+do not support unique or primary key constraints
+
+statement error
+SELECT * FROM ball_index_within('no_such_index', 0, 0, 1);
+----
+does not exist
+
+statement ok
+CREATE INDEX w_art ON w (a);
+
+statement error
+SELECT * FROM ball_index_within('w_art', 0, 0, 1);
+----
+not a BALL_TREE index
+
+statement error
+SELECT * FROM ball_index_within('t_idx', 91, 0, 1);
+----
+invalid query point
+
+statement error
+SELECT * FROM ball_index_within('t_idx', 0, 0, -1);
+----
+radius_km must be >= 0
+
+statement error
+SELECT * FROM ball_index_nearest('t_idx', 0, 0, -1);
+----
+k must be >= 0
+
+# an out-of-range coordinate is rejected and the table is left unchanged
+query I
+SELECT count(*) FROM t;
+----
+6
+
+statement error
+INSERT INTO t VALUES (99, 'bad', 95, 0);
+----
+invalid coordinate
+
+query I
+SELECT count(*) FROM t;
+----
+6
+
+query IIII
+SELECT stale, pending_inserts, pending_deletes, tree_points FROM ball_index_info() WHERE index_name = 't_idx';
+----
+false	0	0	5

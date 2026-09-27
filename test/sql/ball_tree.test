@@ -1,0 +1,158 @@
+# name: test/sql/ball_tree.test
+# description: test ball_tree extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT * FROM ball_degree('pts', 'id', 'lat', 'lon', 10);
+----
+Catalog Error: Table Function with name ball_degree does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require ball_tree
+
+# Points on the equator are 111.195 km apart per degree of longitude; id 4 is far away.
+statement ok
+CREATE TABLE pts AS SELECT * FROM (VALUES
+    (1, 0.0, 0.0),
+    (2, 0.0, 1.0),
+    (3, 0.0, 2.0),
+    (4, 10.0, 10.0),
+    (5, NULL, 3.0)
+) t(id, lat, lon);
+
+# ball_degree: neighbours within the radius, not counting the point itself. Rows with NULLs are skipped.
+query II
+SELECT id, degree FROM ball_degree('pts', 'id', 'lat', 'lon', 120) ORDER BY id;
+----
+1	1
+2	2
+3	1
+4	0
+
+query II
+SELECT id, degree FROM ball_degree('pts', 'id', 'lat', 'lon', 250) ORDER BY id;
+----
+1	2
+2	2
+3	2
+4	0
+
+# radius 0: no neighbours
+query II
+SELECT id, degree FROM ball_degree('pts', 'id', 'lat', 'lon', 0) ORDER BY id;
+----
+1	0
+2	0
+3	0
+4	0
+
+# the point with the highest degree
+query II
+SELECT id, degree FROM ball_degree('pts', 'id', 'lat', 'lon', 120) ORDER BY degree DESC LIMIT 1;
+----
+2	2
+
+# ball_within: nearest first, query point excluded
+query II
+SELECT id, round(distance_km, 1) FROM ball_within('pts', 'id', 'lat', 'lon', 2, 120);
+----
+1	111.2
+3	111.2
+
+query II
+SELECT id, round(distance_km, 1) FROM ball_within('pts', 'id', 'lat', 'lon', 1, 250);
+----
+2	111.2
+3	222.4
+
+query I
+SELECT count(*) FROM ball_within('pts', 'id', 'lat', 'lon', 4, 100);
+----
+0
+
+# ball_nearest
+query II
+SELECT id, round(distance_km, 1) FROM ball_nearest('pts', 'id', 'lat', 'lon', 1, 2);
+----
+2	111.2
+3	222.4
+
+# k larger than the number of other points returns all of them
+query I
+SELECT count(*) FROM ball_nearest('pts', 'id', 'lat', 'lon', 1, 100);
+----
+3
+
+# leaf_size does not change results
+query II
+SELECT id, degree FROM ball_degree('pts', 'id', 'lat', 'lon', 120, leaf_size := 1) ORDER BY id;
+----
+1	1
+2	2
+3	1
+4	0
+
+# schema-qualified table names work
+statement ok
+CREATE SCHEMA s;
+
+statement ok
+CREATE TABLE s.pts AS SELECT * FROM pts;
+
+query I
+SELECT count(*) FROM ball_degree('s.pts', 'id', 'lat', 'lon', 120);
+----
+4
+
+# errors
+statement error
+SELECT * FROM ball_within('pts', 'id', 'lat', 'lon', 99, 10);
+----
+unknown id: 99
+
+statement error
+SELECT * FROM ball_degree('pts', 'id', 'lat', 'lon', -1);
+----
+radius_km must be >= 0
+
+statement error
+SELECT * FROM ball_degree('pts', 'id', 'lat', 'lon', 10, leaf_size := 0);
+----
+leaf_size must be >= 1
+
+statement error
+SELECT * FROM ball_degree('no_such_table', 'id', 'lat', 'lon', 10);
+----
+could not read points
+
+statement ok
+CREATE TABLE bad AS SELECT 1 AS id, 95.0 AS lat, 0.0 AS lon;
+
+statement error
+SELECT * FROM ball_degree('bad', 'id', 'lat', 'lon', 10);
+----
+invalid coordinate
+
+# a prepared statement reads the table again on every execution
+statement ok
+CREATE TABLE prep (id INTEGER, lat DOUBLE, lon DOUBLE);
+
+statement ok
+INSERT INTO prep VALUES (1, 0, 0), (2, 0, 1), (3, 0, 2);
+
+statement ok
+PREPARE pd AS SELECT max(degree) FROM ball_degree('prep', 'id', 'lat', 'lon', 120);
+
+query I
+EXECUTE pd;
+----
+2
+
+statement ok
+INSERT INTO prep VALUES (4, 0, 1.5);
+
+query I
+EXECUTE pd;
+----
+3
