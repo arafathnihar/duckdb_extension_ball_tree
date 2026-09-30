@@ -1,0 +1,440 @@
+# name: test/sql/ball_tree_pairs.test
+# description: ball_index_pairs: every pair of indexed points within a radius
+# group: [sql]
+
+load __TEST_DIR__/ball_tree_pairs.db
+
+require ball_tree
+
+# `symmetric` is a reserved word in DuckDB's grammar (BETWEEN SYMMETRIC), so the named parameter is quoted.
+
+statement ok
+PRAGMA wal_autocheckpoint='1TB';
+
+# 3,000 scattered points over the US (a low-discrepancy sequence, so no two are at a round distance), a dense
+# cluster around (40, -100) with an exact duplicate of its first point, and rows that are not indexed.
+statement ok
+CREATE TABLE p AS SELECT i AS id, 25 + 20 * ((i * 0.6180339887498949::DOUBLE) % 1) AS lat, -120 + 50 * ((i * 0.7548776662466927::DOUBLE) % 1) AS lon FROM range(3000) t(i);
+
+statement ok
+INSERT INTO p SELECT 10000 + i, (40 + (i % 6) * 0.07)::DOUBLE, (-100 + (i // 6) * 0.09)::DOUBLE FROM range(30) t(i);
+
+statement ok
+INSERT INTO p VALUES (10100, 40.0, -100.0), (20000, NULL, 5), (20001, NULL, NULL);
+
+statement ok
+CREATE INDEX p_idx ON p USING BALL_TREE (lat, lon);
+
+# the same points in a much deeper tree
+statement ok
+CREATE INDEX p_deep ON p USING BALL_TREE (lat, lon) WITH (leaf_size = 3);
+
+# brute force, for reference
+statement ok
+CREATE TABLE brute AS
+SELECT a.rowid AS row_id_a, b.rowid AS row_id_b,
+       2 * 6371.0088 * asin(sqrt(sin((radians(b.lat) - radians(a.lat)) / 2) ^ 2 + cos(radians(a.lat)) * cos(radians(b.lat)) * sin((radians(b.lon) - radians(a.lon)) / 2) ^ 2)) AS distance_km
+FROM p a, p b
+WHERE a.rowid <> b.rowid AND a.lat IS NOT NULL AND b.lat IS NOT NULL;
+
+#===----------------------------------------------------------------------===#
+# Agreement with brute force
+#===----------------------------------------------------------------------===#
+
+foreach radius 20 50 200
+
+query I
+SELECT count(*) > 0 FROM ball_index_pairs('p_idx', ${radius});
+----
+true
+
+# the same pairs ...
+query I
+SELECT count(*) FROM (
+    (SELECT row_id_a, row_id_b FROM ball_index_pairs('p_idx', ${radius}) EXCEPT ALL SELECT row_id_a, row_id_b FROM brute WHERE distance_km <= ${radius})
+    UNION ALL
+    (SELECT row_id_a, row_id_b FROM brute WHERE distance_km <= ${radius} EXCEPT ALL SELECT row_id_a, row_id_b FROM ball_index_pairs('p_idx', ${radius}))
+);
+----
+0
+
+# ... at the same distances
+query I
+SELECT count(*) FROM ball_index_pairs('p_idx', ${radius}) q JOIN brute USING (row_id_a, row_id_b) WHERE abs(q.distance_km - brute.distance_km) > 1e-9;
+----
+0
+
+# a tree of a different shape finds the same pairs
+query I
+SELECT count(*) FROM (
+    (SELECT row_id_a, row_id_b FROM ball_index_pairs('p_idx', ${radius}) EXCEPT ALL SELECT row_id_a, row_id_b FROM ball_index_pairs('p_deep', ${radius}))
+    UNION ALL
+    (SELECT row_id_a, row_id_b FROM ball_index_pairs('p_deep', ${radius}) EXCEPT ALL SELECT row_id_a, row_id_b FROM ball_index_pairs('p_idx', ${radius}))
+);
+----
+0
+
+endloop
+
+# a point is never paired with itself
+query I
+SELECT count(*) FROM ball_index_pairs('p_idx', 500) WHERE row_id_a = row_id_b;
+----
+0
+
+#===----------------------------------------------------------------------===#
+# Agreement with ball_index_degree: one row per neighbour, and no rows for a point without any
+#===----------------------------------------------------------------------===#
+
+foreach radius 20 50 200
+
+query I
+SELECT count(*) FROM ball_index_degree('p_idx', ${radius}) d
+LEFT JOIN (SELECT row_id_a, count(*) AS n FROM ball_index_pairs('p_idx', ${radius}) GROUP BY row_id_a) q ON q.row_id_a = d.row_id
+WHERE coalesce(q.n, 0) <> d.degree;
+----
+0
+
+endloop
+
+# some points have no neighbours at 20 km, so the check above covers them
+query I
+SELECT count(*) > 100 FROM ball_index_degree('p_idx', 20) WHERE degree = 0;
+----
+true
+
+#===----------------------------------------------------------------------===#
+# Agreement with ball_index_within: a point's pairs are the points within the radius of it, minus itself
+#===----------------------------------------------------------------------===#
+
+# (40, -100) is both id 10000 and id 10100; each is the other's neighbour at distance 0
+query II
+SELECT p.id, q.distance_km FROM ball_index_pairs('p_idx', 1) q JOIN p ON p.rowid = q.row_id_b WHERE q.row_id_a = (SELECT rowid FROM p WHERE id = 10000);
+----
+10100	0.0
+
+foreach radius 10 20 50
+
+query IIII
+SELECT count(*) FILTER (WHERE q.row_id_b IS NULL), count(*) FILTER (WHERE w.row_id IS NULL),
+       count(*) FILTER (WHERE abs(w.distance_km - q.distance_km) > 1e-9), count(*) > 0
+FROM (SELECT row_id, distance_km FROM ball_index_within('p_idx', 40.0, -100.0, ${radius}) WHERE row_id <> (SELECT rowid FROM p WHERE id = 10000)) w
+FULL OUTER JOIN (SELECT row_id_b, distance_km FROM ball_index_pairs('p_idx', ${radius}) WHERE row_id_a = (SELECT rowid FROM p WHERE id = 10000)) q
+ON w.row_id = q.row_id_b;
+----
+0	0	0	true
+
+query IIII
+SELECT count(*) FILTER (WHERE q.row_id_b IS NULL), count(*) FILTER (WHERE w.row_id IS NULL),
+       count(*) FILTER (WHERE abs(w.distance_km - q.distance_km) > 1e-9), count(*) > 0
+FROM (SELECT row_id, distance_km FROM ball_index_within('p_idx', 40.0, -100.0, ${radius}) WHERE row_id <> (SELECT rowid FROM p WHERE id = 10100)) w
+FULL OUTER JOIN (SELECT row_id_b, distance_km FROM ball_index_pairs('p_idx', ${radius}) WHERE row_id_a = (SELECT rowid FROM p WHERE id = 10100)) q
+ON w.row_id = q.row_id_b;
+----
+0	0	0	true
+
+query IIII
+SELECT count(*) FILTER (WHERE q.row_id_b IS NULL), count(*) FILTER (WHERE w.row_id IS NULL),
+       count(*) FILTER (WHERE abs(w.distance_km - q.distance_km) > 1e-9), count(*) > 0
+FROM (SELECT row_id, distance_km FROM ball_index_within('p_idx', 40.35, -99.82, ${radius}) WHERE row_id <> (SELECT rowid FROM p WHERE id = 10017)) w
+FULL OUTER JOIN (SELECT row_id_b, distance_km FROM ball_index_pairs('p_idx', ${radius}) WHERE row_id_a = (SELECT rowid FROM p WHERE id = 10017)) q
+ON w.row_id = q.row_id_b;
+----
+0	0	0	true
+
+query IIII
+SELECT count(*) FILTER (WHERE q.row_id_b IS NULL), count(*) FILTER (WHERE w.row_id IS NULL),
+       count(*) FILTER (WHERE abs(w.distance_km - q.distance_km) > 1e-9), count(*) > 0
+FROM (SELECT row_id, distance_km FROM ball_index_within('p_idx', 40.35, -99.64, ${radius}) WHERE row_id <> (SELECT rowid FROM p WHERE id = 10029)) w
+FULL OUTER JOIN (SELECT row_id_b, distance_km FROM ball_index_pairs('p_idx', ${radius}) WHERE row_id_a = (SELECT rowid FROM p WHERE id = 10029)) q
+ON w.row_id = q.row_id_b;
+----
+0	0	0	true
+
+endloop
+
+#===----------------------------------------------------------------------===#
+# symmetric := false: each pair once, with row_id_a < row_id_b
+#===----------------------------------------------------------------------===#
+
+foreach radius 20 50 200
+
+query II
+SELECT (SELECT count(*) FROM ball_index_pairs('p_idx', ${radius})) = 2 * count(*), count(*) FILTER (WHERE row_id_a >= row_id_b)
+FROM ball_index_pairs('p_idx', ${radius}, "symmetric" := false);
+----
+true	0
+
+# with its mirror image it is the symmetric result
+query I
+SELECT count(*) FROM (
+    (SELECT row_id_a, row_id_b FROM ball_index_pairs('p_idx', ${radius})
+     EXCEPT ALL
+     (SELECT row_id_a, row_id_b FROM ball_index_pairs('p_idx', ${radius}, "symmetric" := false)
+      UNION ALL SELECT row_id_b, row_id_a FROM ball_index_pairs('p_idx', ${radius}, "symmetric" := false)))
+    UNION ALL
+    ((SELECT row_id_a, row_id_b FROM ball_index_pairs('p_idx', ${radius}, "symmetric" := false)
+      UNION ALL SELECT row_id_b, row_id_a FROM ball_index_pairs('p_idx', ${radius}, "symmetric" := false))
+     EXCEPT ALL
+     SELECT row_id_a, row_id_b FROM ball_index_pairs('p_idx', ${radius}))
+);
+----
+0
+
+endloop
+
+query I
+SELECT (SELECT count(*) FROM ball_index_pairs('p_idx', 50, "symmetric" := true)) = (SELECT count(*) FROM ball_index_pairs('p_idx', 50));
+----
+true
+
+#===----------------------------------------------------------------------===#
+# One thread gives the same answer as many
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE parallel_pairs AS SELECT * FROM ball_index_pairs('p_idx', 200);
+
+statement ok
+SET threads = 1;
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM ball_index_pairs('p_idx', 200) EXCEPT ALL SELECT * FROM parallel_pairs)
+    UNION ALL
+    (SELECT * FROM parallel_pairs EXCEPT ALL SELECT * FROM ball_index_pairs('p_idx', 200))
+);
+----
+0
+
+statement ok
+RESET threads;
+
+#===----------------------------------------------------------------------===#
+# Edge cases
+#===----------------------------------------------------------------------===#
+
+# an empty table, and one whose rows have no coordinates
+statement ok
+CREATE TABLE e (lat DOUBLE, lon DOUBLE);
+
+statement ok
+CREATE INDEX e_idx ON e USING BALL_TREE (lat, lon);
+
+query I
+SELECT count(*) FROM ball_index_pairs('e_idx', 100000);
+----
+0
+
+statement ok
+INSERT INTO e VALUES (NULL, NULL), (NULL, 1), (1, NULL);
+
+query I
+SELECT count(*) FROM ball_index_pairs('e_idx', 100000);
+----
+0
+
+# a single point has no pairs
+statement ok
+INSERT INTO e VALUES (1, 1);
+
+query I
+SELECT count(*) FROM ball_index_pairs('e_idx', 100000);
+----
+0
+
+# radius 0 pairs up points at identical coordinates only
+statement ok
+CREATE TABLE dup (id INTEGER, lat DOUBLE, lon DOUBLE);
+
+statement ok
+INSERT INTO dup VALUES (1, 10, 10), (2, 10, 10), (3, 10, 10), (4, 20, 20), (5, 20, 20), (6, 30, 30), (7, 10, 10.000001);
+
+statement ok
+CREATE INDEX dup_idx ON dup USING BALL_TREE (lat, lon) WITH (leaf_size = 1);
+
+query III
+SELECT a.id, b.id, q.distance_km FROM ball_index_pairs('dup_idx', 0) q JOIN dup a ON a.rowid = q.row_id_a JOIN dup b ON b.rowid = q.row_id_b ORDER BY a.id, b.id;
+----
+1	2	0.0
+1	3	0.0
+2	1	0.0
+2	3	0.0
+3	1	0.0
+3	2	0.0
+4	5	0.0
+5	4	0.0
+
+query II
+SELECT a.id, b.id FROM ball_index_pairs('dup_idx', 0, "symmetric" := false) q JOIN dup a ON a.rowid = q.row_id_a JOIN dup b ON b.rowid = q.row_id_b ORDER BY a.id, b.id;
+----
+1	2
+1	3
+2	3
+4	5
+
+# a radius that takes in the whole sphere (half the circumference is about 20,015 km): every point pairs with
+# every other, so each point's neighbours span several output chunks
+statement ok
+CREATE TABLE g AS SELECT (i * 0.6180339887498949::DOUBLE % 1) * 180 - 90 AS lat, (i * 0.7548776662466927::DOUBLE % 1) * 360 - 180 AS lon FROM range(5000) t(i);
+
+statement ok
+CREATE INDEX g_idx ON g USING BALL_TREE (lat, lon);
+
+query III
+SELECT count(*), count(DISTINCT row_id_a), max(distance_km) <= 20016 FROM ball_index_pairs('g_idx', 25000);
+----
+24995000	5000	true
+
+query II
+SELECT min(n), max(n) FROM (SELECT count(*) AS n FROM ball_index_pairs('g_idx', 20100) GROUP BY row_id_a);
+----
+4999	4999
+
+query I
+SELECT count(*) FROM ball_index_pairs('g_idx', 20100, "symmetric" := false);
+----
+12497500
+
+# across the antimeridian and at the poles
+statement ok
+CREATE TABLE edge (id INTEGER, lat DOUBLE, lon DOUBLE);
+
+statement ok
+INSERT INTO edge VALUES
+    (1, 0, 179.99), (2, 0, -179.99),
+    (3, 60, 179.99), (4, 60, -179.99),
+    (5, 89.99, 0), (6, 89.99, 180),
+    (7, 90, 0), (8, 90, 123),
+    (9, -90, 0), (10, -89.99, -90),
+    (11, 0, 0), (12, 45, 90);
+
+statement ok
+CREATE INDEX edge_idx ON edge USING BALL_TREE (lat, lon) WITH (leaf_size = 1);
+
+query III
+SELECT a.id, b.id, round(q.distance_km, 3) FROM ball_index_pairs('edge_idx', 5, "symmetric" := false) q
+JOIN edge a ON a.rowid = q.row_id_a JOIN edge b ON b.rowid = q.row_id_b ORDER BY a.id, b.id;
+----
+1	2	2.224
+3	4	1.112
+5	6	2.224
+5	7	1.112
+5	8	1.112
+6	7	1.112
+6	8	1.112
+7	8	0.0
+9	10	1.112
+
+#===----------------------------------------------------------------------===#
+# A stale index is rebuilt once, at the start of the query
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE s (id INTEGER, lat DOUBLE, lon DOUBLE);
+
+statement ok
+INSERT INTO s VALUES (1, 0, 0), (2, 0, 0.5), (3, 0, 5);
+
+statement ok
+CREATE INDEX s_idx ON s USING BALL_TREE (lat, lon);
+
+query I
+SELECT count(*) FROM ball_index_pairs('s_idx', 100);
+----
+2
+
+statement ok
+INSERT INTO s VALUES (4, 0, 5.5);
+
+statement ok
+DELETE FROM s WHERE id = 2;
+
+query II
+SELECT stale, rebuilds FROM ball_index_info() WHERE index_name = 's_idx';
+----
+true	0
+
+query II
+SELECT a.id, b.id FROM ball_index_pairs('s_idx', 100) q JOIN s a ON a.rowid = q.row_id_a JOIN s b ON b.rowid = q.row_id_b ORDER BY a.id, b.id;
+----
+3	4
+4	3
+
+query II
+SELECT stale, rebuilds FROM ball_index_info() WHERE index_name = 's_idx';
+----
+false	1
+
+query I
+SELECT count(*) FROM ball_index_pairs('s_idx', 100);
+----
+2
+
+query I
+SELECT rebuilds FROM ball_index_info() WHERE index_name = 's_idx';
+----
+1
+
+#===----------------------------------------------------------------------===#
+# After a restart, the stored tree answers without a rebuild
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE before_restart AS SELECT * FROM ball_index_pairs('p_idx', 50);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM ball_index_pairs('p_idx', 50) EXCEPT ALL SELECT * FROM before_restart)
+    UNION ALL
+    (SELECT * FROM before_restart EXCEPT ALL SELECT * FROM ball_index_pairs('p_idx', 50))
+);
+----
+0
+
+query I
+SELECT rebuilds FROM ball_index_info() WHERE index_name = 'p_idx';
+----
+0
+
+#===----------------------------------------------------------------------===#
+# Errors
+#===----------------------------------------------------------------------===#
+
+statement error
+SELECT * FROM ball_index_pairs('p_idx', NULL);
+----
+radius_km must not be NULL
+
+statement error
+SELECT * FROM ball_index_pairs('p_idx', -1);
+----
+radius_km must be >= 0
+
+statement error
+SELECT * FROM ball_index_pairs(NULL, 1);
+----
+index name must not be NULL
+
+statement error
+SELECT * FROM ball_index_pairs('p_idx', 1, "symmetric" := NULL);
+----
+symmetric must not be NULL
+
+statement error
+SELECT * FROM ball_index_pairs('no_such_index', 1);
+----
+does not exist
+
+statement ok
+CREATE INDEX p_art ON p (id);
+
+statement error
+SELECT * FROM ball_index_pairs('p_art', 1);
+----
+not a BALL_TREE index

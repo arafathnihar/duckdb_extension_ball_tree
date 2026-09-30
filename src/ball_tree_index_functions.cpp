@@ -17,6 +17,7 @@
 #include "duckdb/storage/table/table_index_list.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 namespace duckdb {
@@ -222,15 +223,20 @@ unique_ptr<GlobalTableFunctionState> QueryInit(ClientContext &context, TableFunc
 	return std::move(state);
 }
 
+//! Points the index will hold once pending changes are folded in. Never triggers a rebuild.
+idx_t EstimatedPoints(ClientContext &context, const string &index_name) {
+	const auto stats = FindIndex(context, index_name).GetStats();
+	return stats.tree_points + stats.pending_inserts > stats.pending_deletes
+	           ? stats.tree_points + stats.pending_inserts - stats.pending_deletes
+	           : 0;
+}
+
 //! Row estimates for the planner. Without them it has to guess, and the documented pattern
 //! (`ball_index_within(...) w JOIN big_table ON big_table.rowid = w.row_id`) could end up hashing the big table
 //! instead of the few rows the function returns.
 unique_ptr<NodeStatistics> QueryCardinality(ClientContext &context, const FunctionData *bind_data_p) {
 	auto &data = bind_data_p->Cast<IndexQueryBindData>();
-	const auto stats = FindIndex(context, data.index_name).GetStats();
-	const idx_t points = stats.tree_points + stats.pending_inserts > stats.pending_deletes
-	                         ? stats.tree_points + stats.pending_inserts - stats.pending_deletes
-	                         : 0;
+	const idx_t points = EstimatedPoints(context, data.index_name);
 	switch (data.kind) {
 	case QueryKind::DEGREE:
 		return make_uniq<NodeStatistics>(points, points); // one row per point
@@ -268,6 +274,150 @@ void DistanceScan(ClientContext &, TableFunctionInput &input, DataChunk &output)
 	}
 	state.offset += count;
 	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
+// ball_index_pairs(index, radius_km [, symmetric := true]) -> (row_id_a, row_id_b, distance_km)
+//
+// Every pair of distinct indexed points within the radius. Unlike the functions above, the result can be far
+// larger than the table, so it is streamed: threads claim batches of points (in tree order, for locality) from
+// a shared cursor and emit their neighbours a chunk at a time. Output order is unspecified.
+//===--------------------------------------------------------------------===//
+
+struct PairsBindData : public FunctionData {
+	string index_name;
+	double radius_km = 0;
+	//! emit (a, b) and (b, a); otherwise each pair once, with row_id_a < row_id_b
+	bool symmetric = true;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto copy = make_uniq<PairsBindData>();
+		copy->index_name = index_name;
+		copy->radius_km = radius_km;
+		copy->symmetric = symmetric;
+		return std::move(copy);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<PairsBindData>();
+		return index_name == other.index_name && radius_km == other.radius_km && symmetric == other.symmetric;
+	}
+};
+
+//! Points a thread claims from the shared cursor at a time.
+constexpr idx_t PAIRS_BATCH = 256;
+
+struct PairsGlobalState : public GlobalTableFunctionState {
+	//! the tree as of the start of the scan, shared by every thread; immutable
+	std::shared_ptr<const BallTreeSnapshot> snapshot;
+	double radius = 0; // angular
+	bool symmetric = true;
+	//! next unclaimed tree position
+	std::atomic<idx_t> next {0};
+	idx_t max_threads = 1;
+
+	idx_t MaxThreads() const override {
+		return max_threads;
+	}
+};
+
+struct PairsLocalState : public LocalTableFunctionState {
+	//! the claimed batch of tree positions not yet queried: [pos, end)
+	idx_t pos = 0;
+	idx_t end = 0;
+	//! the point being emitted and its neighbours (tree ids, angular distances); `emitted` of them are done
+	row_t row_a = 0;
+	vector<int64_t> hits;
+	vector<double> distances;
+	idx_t emitted = 0;
+};
+
+unique_ptr<FunctionData> PairsBind(ClientContext &context, TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto data = make_uniq<PairsBindData>();
+	data->index_name = IndexNameArg(input);
+	data->radius_km = RadiusArg(input.inputs[1]);
+	auto symmetric = input.named_parameters.find("symmetric");
+	if (symmetric != input.named_parameters.end()) {
+		if (symmetric->second.IsNull()) {
+			throw InvalidInputException("ball_index: symmetric must not be NULL");
+		}
+		data->symmetric = symmetric->second.GetValue<bool>();
+	}
+	FindIndex(context, data->index_name);
+	return_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::DOUBLE};
+	names = {"row_id_a", "row_id_b", "distance_km"};
+	return std::move(data);
+}
+
+unique_ptr<GlobalTableFunctionState> PairsInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+	auto &data = input.bind_data->Cast<PairsBindData>();
+	auto state = make_uniq<PairsGlobalState>();
+	state->snapshot = FindIndex(context, data.index_name).GetSnapshot();
+	state->radius = data.radius_km / EARTH_RADIUS_KM;
+	state->symmetric = data.symmetric;
+	const idx_t n_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	state->max_threads = MaxValue<idx_t>(1, MinValue<idx_t>(n_threads, state->snapshot->Count() / PAIRS_BATCH + 1));
+	return std::move(state);
+}
+
+unique_ptr<LocalTableFunctionState> PairsInitLocal(ExecutionContext &, TableFunctionInitInput &,
+                                                   GlobalTableFunctionState *) {
+	return make_uniq<PairsLocalState>();
+}
+
+//! Fills `output` with up to STANDARD_VECTOR_SIZE pairs; returns fewer only when this thread's work is done.
+void PairsScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &global = input.global_state->Cast<PairsGlobalState>();
+	auto &local = input.local_state->Cast<PairsLocalState>();
+	auto &snapshot = *global.snapshot;
+	auto row_ids_a = FlatVector::GetData<int64_t>(output.data[0]);
+	auto row_ids_b = FlatVector::GetData<int64_t>(output.data[1]);
+	auto distances = FlatVector::GetData<double>(output.data[2]);
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE) {
+		if (local.emitted < local.hits.size()) {
+			// the current point's neighbours
+			const row_t row_b = snapshot.row_ids[local.hits[local.emitted]];
+			if (global.symmetric || local.row_a < row_b) {
+				row_ids_a[count] = local.row_a;
+				row_ids_b[count] = row_b;
+				distances[count] = local.distances[local.emitted] * EARTH_RADIUS_KM;
+				count++;
+			}
+			local.emitted++;
+		} else if (local.pos < local.end) {
+			// the next point of the batch
+			const int64_t id = snapshot.tree->IdAt(local.pos++);
+			local.row_a = snapshot.row_ids[id];
+			snapshot.tree->QueryRadiusFrom(static_cast<size_t>(id), global.radius, local.hits, &local.distances);
+			local.emitted = 0;
+		} else {
+			// a new batch
+			if (!snapshot.tree) {
+				break;
+			}
+			const idx_t start = global.next.fetch_add(PAIRS_BATCH);
+			if (start >= snapshot.Count()) {
+				break;
+			}
+			local.pos = start;
+			local.end = MinValue<idx_t>(start + PAIRS_BATCH, snapshot.Count());
+		}
+	}
+	output.SetCardinality(count);
+}
+
+//! Pairs are rarely known before running: assume a handful of neighbours per point. An estimate above the table
+//! size keeps the planner hashing the table, not the pairs, when both sides are joined back to it.
+unique_ptr<NodeStatistics> PairsCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+	auto &data = bind_data_p->Cast<PairsBindData>();
+	const idx_t points = EstimatedPoints(context, data.index_name);
+	// every ordered pair, saturating (the tree allows up to 2^40 points)
+	const double all_pairs = static_cast<double>(points) * static_cast<double>(points > 0 ? points - 1 : 0);
+	const idx_t max_pairs = all_pairs >= static_cast<double>(NumericLimits<int64_t>::Maximum())
+	                            ? NumericCast<idx_t>(NumericLimits<int64_t>::Maximum())
+	                            : static_cast<idx_t>(all_pairs) / (data.symmetric ? 1 : 2);
+	return make_uniq<NodeStatistics>(MinValue<idx_t>(max_pairs, points * 10), max_pairs);
 }
 
 //===--------------------------------------------------------------------===//
@@ -343,6 +493,11 @@ void RegisterBallTreeIndex(ExtensionLoader &loader) {
 	TableFunction nearest("ball_index_nearest", {V, D, D, B}, DistanceScan, NearestBind, QueryInit);
 	nearest.cardinality = QueryCardinality;
 	loader.RegisterFunction(nearest);
+
+	TableFunction pairs("ball_index_pairs", {V, D}, PairsScan, PairsBind, PairsInitGlobal, PairsInitLocal);
+	pairs.named_parameters["symmetric"] = LogicalType::BOOLEAN;
+	pairs.cardinality = PairsCardinality;
+	loader.RegisterFunction(pairs);
 
 	loader.RegisterFunction(TableFunction("ball_index_info", {}, InfoScan, InfoBind, InfoInit));
 }
