@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -280,38 +281,56 @@ void DistanceScan(ClientContext &, TableFunctionInput &input, DataChunk &output)
 // ball_index_pairs(index, radius_km [, symmetric := true]) -> (row_id_a, row_id_b, distance_km)
 //
 // Every pair of distinct indexed points within the radius. Unlike the functions above, the result can be far
-// larger than the table, so it is streamed: threads claim batches of points (in tree order, for locality) from
-// a shared cursor and emit their neighbours a chunk at a time. Output order is unspecified.
+// larger than the table, so it is streamed: threads claim work from a shared cursor and emit it a chunk at a
+// time, holding a bounded amount of it each. Output order is unspecified.
+//
+// Two algorithms give the same pairs:
+//   * 'dual' (default): a dual-tree self-join. The top of the traversal is split into independent node pairs,
+//     which threads claim one at a time and walk with an explicit stack that pauses when the chunk is full.
+//     Each unordered pair is found once.
+//   * 'single': one radius query per point. Threads claim batches of points in tree order (for locality).
+//     Each unordered pair is found twice, once from each end.
+// The hidden `algorithm := 'single'|'dual'` parameter picks one, for testing and benchmarking.
 //===--------------------------------------------------------------------===//
+
+enum class PairsAlgorithm : uint8_t { SINGLE, DUAL };
 
 struct PairsBindData : public FunctionData {
 	string index_name;
 	double radius_km = 0;
 	//! emit (a, b) and (b, a); otherwise each pair once, with row_id_a < row_id_b
 	bool symmetric = true;
+	PairsAlgorithm algorithm = PairsAlgorithm::DUAL;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<PairsBindData>();
 		copy->index_name = index_name;
 		copy->radius_km = radius_km;
 		copy->symmetric = symmetric;
+		copy->algorithm = algorithm;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<PairsBindData>();
-		return index_name == other.index_name && radius_km == other.radius_km && symmetric == other.symmetric;
+		return index_name == other.index_name && radius_km == other.radius_km && symmetric == other.symmetric &&
+		       algorithm == other.algorithm;
 	}
 };
 
-//! Points a thread claims from the shared cursor at a time.
+//! Points a thread claims from the shared cursor at a time ('single').
 constexpr idx_t PAIRS_BATCH = 256;
+//! Node pairs to split the dual-tree traversal into, per thread, so a thread that finishes early can take more.
+constexpr idx_t PAIRS_TASKS_PER_THREAD = 32;
 
 struct PairsGlobalState : public GlobalTableFunctionState {
 	//! the tree as of the start of the scan, shared by every thread; immutable
 	std::shared_ptr<const BallTreeSnapshot> snapshot;
 	double radius = 0; // angular
 	bool symmetric = true;
-	//! next unclaimed tree position
+	PairsAlgorithm algorithm = PairsAlgorithm::DUAL;
+	//! 'dual': the independent parts of the traversal
+	vector<balltree::BallTree::NodePair> tasks;
+	//! next unclaimed tree position ('single') or task ('dual')
 	std::atomic<idx_t> next {0};
 	idx_t max_threads = 1;
 
@@ -321,6 +340,7 @@ struct PairsGlobalState : public GlobalTableFunctionState {
 };
 
 struct PairsLocalState : public LocalTableFunctionState {
+	// 'single'
 	//! the claimed batch of tree positions not yet queried: [pos, end)
 	idx_t pos = 0;
 	idx_t end = 0;
@@ -329,6 +349,15 @@ struct PairsLocalState : public LocalTableFunctionState {
 	vector<int64_t> hits;
 	vector<double> distances;
 	idx_t emitted = 0;
+
+	// 'dual'
+	unique_ptr<balltree::BallTree::SelfJoin> join;
+	//! `join` is part way through a task
+	bool in_task = false;
+	//! pairs from `join`: tree ids and angular distances
+	vector<int64_t> ids_a;
+	vector<int64_t> ids_b;
+	vector<double> pair_distances;
 };
 
 unique_ptr<FunctionData> PairsBind(ClientContext &context, TableFunctionBindInput &input,
@@ -343,6 +372,17 @@ unique_ptr<FunctionData> PairsBind(ClientContext &context, TableFunctionBindInpu
 		}
 		data->symmetric = symmetric->second.GetValue<bool>();
 	}
+	auto algorithm = input.named_parameters.find("algorithm");
+	if (algorithm != input.named_parameters.end()) {
+		const string name = algorithm->second.IsNull() ? "NULL" : algorithm->second.GetValue<string>();
+		if (StringUtil::CIEquals(name, "single")) {
+			data->algorithm = PairsAlgorithm::SINGLE;
+		} else if (StringUtil::CIEquals(name, "dual")) {
+			data->algorithm = PairsAlgorithm::DUAL;
+		} else {
+			throw InvalidInputException("ball_index: algorithm must be 'single' or 'dual', got %s", name);
+		}
+	}
 	FindIndex(context, data->index_name);
 	return_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::DOUBLE};
 	names = {"row_id_a", "row_id_b", "distance_km"};
@@ -355,26 +395,37 @@ unique_ptr<GlobalTableFunctionState> PairsInitGlobal(ClientContext &context, Tab
 	state->snapshot = FindIndex(context, data.index_name).GetSnapshot();
 	state->radius = data.radius_km / EARTH_RADIUS_KM;
 	state->symmetric = data.symmetric;
+	state->algorithm = data.algorithm;
 	const idx_t n_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
-	state->max_threads = MaxValue<idx_t>(1, MinValue<idx_t>(n_threads, state->snapshot->Count() / PAIRS_BATCH + 1));
+	if (data.algorithm == PairsAlgorithm::SINGLE) {
+		state->max_threads = MinValue<idx_t>(n_threads, state->snapshot->Count() / PAIRS_BATCH + 1);
+	} else if (state->snapshot->tree) {
+		state->tasks = state->snapshot->tree->SelfJoinTasks(state->radius, n_threads * PAIRS_TASKS_PER_THREAD);
+		state->max_threads = MinValue<idx_t>(n_threads, state->tasks.size());
+	}
+	state->max_threads = MaxValue<idx_t>(1, state->max_threads);
 	return std::move(state);
 }
 
 unique_ptr<LocalTableFunctionState> PairsInitLocal(ExecutionContext &, TableFunctionInitInput &,
-                                                   GlobalTableFunctionState *) {
-	return make_uniq<PairsLocalState>();
+                                                   GlobalTableFunctionState *global_p) {
+	auto &global = global_p->Cast<PairsGlobalState>();
+	auto state = make_uniq<PairsLocalState>();
+	if (global.algorithm == PairsAlgorithm::DUAL && global.snapshot->tree) {
+		state->join = make_uniq<balltree::BallTree::SelfJoin>(*global.snapshot->tree, global.radius);
+		state->ids_a.resize(STANDARD_VECTOR_SIZE);
+		state->ids_b.resize(STANDARD_VECTOR_SIZE);
+		state->pair_distances.resize(STANDARD_VECTOR_SIZE);
+	}
+	return std::move(state);
 }
 
-//! Fills `output` with up to STANDARD_VECTOR_SIZE pairs; returns fewer only when this thread's work is done.
-void PairsScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
-	auto &global = input.global_state->Cast<PairsGlobalState>();
-	auto &local = input.local_state->Cast<PairsLocalState>();
+//! 'single': writes up to `capacity` rows from the neighbours of this thread's points.
+idx_t PairsScanSingle(PairsGlobalState &global, PairsLocalState &local, int64_t *row_ids_a, int64_t *row_ids_b,
+                      double *distances, idx_t capacity) {
 	auto &snapshot = *global.snapshot;
-	auto row_ids_a = FlatVector::GetData<int64_t>(output.data[0]);
-	auto row_ids_b = FlatVector::GetData<int64_t>(output.data[1]);
-	auto distances = FlatVector::GetData<double>(output.data[2]);
 	idx_t count = 0;
-	while (count < STANDARD_VECTOR_SIZE) {
+	while (count < capacity) {
 		if (local.emitted < local.hits.size()) {
 			// the current point's neighbours
 			const row_t row_b = snapshot.row_ids[local.hits[local.emitted]];
@@ -393,15 +444,70 @@ void PairsScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 			local.emitted = 0;
 		} else {
 			// a new batch
-			if (!snapshot.tree) {
-				break;
-			}
 			const idx_t start = global.next.fetch_add(PAIRS_BATCH);
 			if (start >= snapshot.Count()) {
 				break;
 			}
 			local.pos = start;
 			local.end = MinValue<idx_t>(start + PAIRS_BATCH, snapshot.Count());
+		}
+	}
+	return count;
+}
+
+//! 'dual': writes up to `capacity` rows from the node pairs this thread claims.
+idx_t PairsScanDual(PairsGlobalState &global, PairsLocalState &local, int64_t *row_ids_a, int64_t *row_ids_b,
+                    double *distances, idx_t capacity) {
+	auto &row_ids = global.snapshot->row_ids;
+	idx_t count = 0;
+	while (true) {
+		// a symmetric pair takes two rows
+		const idx_t room = global.symmetric ? (capacity - count) / 2 : capacity - count;
+		if (room == 0) {
+			break;
+		}
+		if (!local.in_task) {
+			const idx_t task = global.next.fetch_add(1);
+			if (task >= global.tasks.size()) {
+				break;
+			}
+			local.join->Start(global.tasks[task]);
+			local.in_task = true;
+		}
+		const idx_t found = local.join->Next(local.ids_a.data(), local.ids_b.data(), local.pair_distances.data(), room);
+		if (found < room) {
+			local.in_task = false;
+		}
+		for (idx_t i = 0; i < found; i++) {
+			const row_t a = row_ids[local.ids_a[i]];
+			const row_t b = row_ids[local.ids_b[i]];
+			const double distance_km = local.pair_distances[i] * EARTH_RADIUS_KM;
+			row_ids_a[count] = MinValue(a, b);
+			row_ids_b[count] = MaxValue(a, b);
+			distances[count++] = distance_km;
+			if (global.symmetric) {
+				row_ids_a[count] = MaxValue(a, b);
+				row_ids_b[count] = MinValue(a, b);
+				distances[count++] = distance_km;
+			}
+		}
+	}
+	return count;
+}
+
+//! Fills `output` with up to STANDARD_VECTOR_SIZE rows; returns an empty chunk only when this thread's work is done.
+void PairsScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &global = input.global_state->Cast<PairsGlobalState>();
+	auto &local = input.local_state->Cast<PairsLocalState>();
+	idx_t count = 0;
+	if (global.snapshot->tree) {
+		auto row_ids_a = FlatVector::GetData<int64_t>(output.data[0]);
+		auto row_ids_b = FlatVector::GetData<int64_t>(output.data[1]);
+		auto distances = FlatVector::GetData<double>(output.data[2]);
+		if (global.algorithm == PairsAlgorithm::SINGLE) {
+			count = PairsScanSingle(global, local, row_ids_a, row_ids_b, distances, STANDARD_VECTOR_SIZE);
+		} else {
+			count = PairsScanDual(global, local, row_ids_a, row_ids_b, distances, STANDARD_VECTOR_SIZE);
 		}
 	}
 	output.SetCardinality(count);
@@ -496,6 +602,7 @@ void RegisterBallTreeIndex(ExtensionLoader &loader) {
 
 	TableFunction pairs("ball_index_pairs", {V, D}, PairsScan, PairsBind, PairsInitGlobal, PairsInitLocal);
 	pairs.named_parameters["symmetric"] = LogicalType::BOOLEAN;
+	pairs.named_parameters["algorithm"] = V;
 	pairs.cardinality = PairsCardinality;
 	loader.RegisterFunction(pairs);
 

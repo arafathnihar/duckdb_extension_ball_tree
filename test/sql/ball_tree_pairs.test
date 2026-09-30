@@ -189,6 +189,42 @@ SELECT (SELECT count(*) FROM ball_index_pairs('p_idx', 50, "symmetric" := true))
 true
 
 #===----------------------------------------------------------------------===#
+# The dual-tree self-join (the default) and one radius query per point give the same pairs
+#===----------------------------------------------------------------------===#
+
+foreach index p_idx p_deep
+
+foreach radius 0 1 20 50 200 2000
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM ball_index_pairs('${index}', ${radius}, algorithm := 'single') EXCEPT ALL SELECT * FROM ball_index_pairs('${index}', ${radius}, algorithm := 'dual'))
+    UNION ALL
+    (SELECT * FROM ball_index_pairs('${index}', ${radius}, algorithm := 'dual') EXCEPT ALL SELECT * FROM ball_index_pairs('${index}', ${radius}, algorithm := 'single'))
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM ball_index_pairs('${index}', ${radius}, "symmetric" := false, algorithm := 'single') EXCEPT ALL SELECT * FROM ball_index_pairs('${index}', ${radius}, "symmetric" := false))
+    UNION ALL
+    (SELECT * FROM ball_index_pairs('${index}', ${radius}, "symmetric" := false) EXCEPT ALL SELECT * FROM ball_index_pairs('${index}', ${radius}, "symmetric" := false, algorithm := 'single'))
+);
+----
+0
+
+endloop
+
+endloop
+
+# the default is 'dual'; the name is case-insensitive
+query I
+SELECT (SELECT count(*) FROM ball_index_pairs('p_idx', 50)) = (SELECT count(*) FROM ball_index_pairs('p_idx', 50, algorithm := 'DUAL'));
+----
+true
+
+#===----------------------------------------------------------------------===#
 # One thread gives the same answer as many
 #===----------------------------------------------------------------------===#
 
@@ -198,14 +234,18 @@ CREATE TABLE parallel_pairs AS SELECT * FROM ball_index_pairs('p_idx', 200);
 statement ok
 SET threads = 1;
 
+foreach algorithm single dual
+
 query I
 SELECT count(*) FROM (
-    (SELECT * FROM ball_index_pairs('p_idx', 200) EXCEPT ALL SELECT * FROM parallel_pairs)
+    (SELECT * FROM ball_index_pairs('p_idx', 200, algorithm := '${algorithm}') EXCEPT ALL SELECT * FROM parallel_pairs)
     UNION ALL
-    (SELECT * FROM parallel_pairs EXCEPT ALL SELECT * FROM ball_index_pairs('p_idx', 200))
+    (SELECT * FROM parallel_pairs EXCEPT ALL SELECT * FROM ball_index_pairs('p_idx', 200, algorithm := '${algorithm}'))
 );
 ----
 0
+
+endloop
 
 statement ok
 RESET threads;
@@ -221,27 +261,39 @@ CREATE TABLE e (lat DOUBLE, lon DOUBLE);
 statement ok
 CREATE INDEX e_idx ON e USING BALL_TREE (lat, lon);
 
+foreach algorithm single dual
+
 query I
-SELECT count(*) FROM ball_index_pairs('e_idx', 100000);
+SELECT count(*) FROM ball_index_pairs('e_idx', 100000, algorithm := '${algorithm}');
 ----
 0
+
+endloop
 
 statement ok
 INSERT INTO e VALUES (NULL, NULL), (NULL, 1), (1, NULL);
 
+foreach algorithm single dual
+
 query I
-SELECT count(*) FROM ball_index_pairs('e_idx', 100000);
+SELECT count(*) FROM ball_index_pairs('e_idx', 100000, algorithm := '${algorithm}');
 ----
 0
+
+endloop
 
 # a single point has no pairs
 statement ok
 INSERT INTO e VALUES (1, 1);
 
+foreach algorithm single dual
+
 query I
-SELECT count(*) FROM ball_index_pairs('e_idx', 100000);
+SELECT count(*) FROM ball_index_pairs('e_idx', 100000, algorithm := '${algorithm}');
 ----
 0
+
+endloop
 
 # radius 0 pairs up points at identical coordinates only
 statement ok
@@ -253,26 +305,6 @@ INSERT INTO dup VALUES (1, 10, 10), (2, 10, 10), (3, 10, 10), (4, 20, 20), (5, 2
 statement ok
 CREATE INDEX dup_idx ON dup USING BALL_TREE (lat, lon) WITH (leaf_size = 1);
 
-query III
-SELECT a.id, b.id, q.distance_km FROM ball_index_pairs('dup_idx', 0) q JOIN dup a ON a.rowid = q.row_id_a JOIN dup b ON b.rowid = q.row_id_b ORDER BY a.id, b.id;
-----
-1	2	0.0
-1	3	0.0
-2	1	0.0
-2	3	0.0
-3	1	0.0
-3	2	0.0
-4	5	0.0
-5	4	0.0
-
-query II
-SELECT a.id, b.id FROM ball_index_pairs('dup_idx', 0, "symmetric" := false) q JOIN dup a ON a.rowid = q.row_id_a JOIN dup b ON b.rowid = q.row_id_b ORDER BY a.id, b.id;
-----
-1	2
-1	3
-2	3
-4	5
-
 # a radius that takes in the whole sphere (half the circumference is about 20,015 km): every point pairs with
 # every other, so each point's neighbours span several output chunks
 statement ok
@@ -280,21 +312,6 @@ CREATE TABLE g AS SELECT (i * 0.6180339887498949::DOUBLE % 1) * 180 - 90 AS lat,
 
 statement ok
 CREATE INDEX g_idx ON g USING BALL_TREE (lat, lon);
-
-query III
-SELECT count(*), count(DISTINCT row_id_a), max(distance_km) <= 20016 FROM ball_index_pairs('g_idx', 25000);
-----
-24995000	5000	true
-
-query II
-SELECT min(n), max(n) FROM (SELECT count(*) AS n FROM ball_index_pairs('g_idx', 20100) GROUP BY row_id_a);
-----
-4999	4999
-
-query I
-SELECT count(*) FROM ball_index_pairs('g_idx', 20100, "symmetric" := false);
-----
-12497500
 
 # across the antimeridian and at the poles
 statement ok
@@ -312,8 +329,45 @@ INSERT INTO edge VALUES
 statement ok
 CREATE INDEX edge_idx ON edge USING BALL_TREE (lat, lon) WITH (leaf_size = 1);
 
+foreach algorithm single dual
+
 query III
-SELECT a.id, b.id, round(q.distance_km, 3) FROM ball_index_pairs('edge_idx', 5, "symmetric" := false) q
+SELECT a.id, b.id, q.distance_km FROM ball_index_pairs('dup_idx', 0, algorithm := '${algorithm}') q JOIN dup a ON a.rowid = q.row_id_a JOIN dup b ON b.rowid = q.row_id_b ORDER BY a.id, b.id;
+----
+1	2	0.0
+1	3	0.0
+2	1	0.0
+2	3	0.0
+3	1	0.0
+3	2	0.0
+4	5	0.0
+5	4	0.0
+
+query II
+SELECT a.id, b.id FROM ball_index_pairs('dup_idx', 0, "symmetric" := false, algorithm := '${algorithm}') q JOIN dup a ON a.rowid = q.row_id_a JOIN dup b ON b.rowid = q.row_id_b ORDER BY a.id, b.id;
+----
+1	2
+1	3
+2	3
+4	5
+
+query III
+SELECT count(*), count(DISTINCT row_id_a), max(distance_km) <= 20016 FROM ball_index_pairs('g_idx', 25000, algorithm := '${algorithm}');
+----
+24995000	5000	true
+
+query II
+SELECT min(n), max(n) FROM (SELECT count(*) AS n FROM ball_index_pairs('g_idx', 20100, algorithm := '${algorithm}') GROUP BY row_id_a);
+----
+4999	4999
+
+query I
+SELECT count(*) FROM ball_index_pairs('g_idx', 20100, "symmetric" := false, algorithm := '${algorithm}');
+----
+12497500
+
+query III
+SELECT a.id, b.id, round(q.distance_km, 3) FROM ball_index_pairs('edge_idx', 5, "symmetric" := false, algorithm := '${algorithm}') q
 JOIN edge a ON a.rowid = q.row_id_a JOIN edge b ON b.rowid = q.row_id_b ORDER BY a.id, b.id;
 ----
 1	2	2.224
@@ -325,6 +379,8 @@ JOIN edge a ON a.rowid = q.row_id_a JOIN edge b ON b.rowid = q.row_id_b ORDER BY
 6	8	1.112
 7	8	0.0
 9	10	1.112
+
+endloop
 
 #===----------------------------------------------------------------------===#
 # A stale index is rebuilt once, at the start of the query
@@ -438,3 +494,8 @@ statement error
 SELECT * FROM ball_index_pairs('p_art', 1);
 ----
 not a BALL_TREE index
+
+statement error
+SELECT * FROM ball_index_pairs('p_idx', 1, algorithm := 'triple');
+----
+algorithm must be 'single' or 'dual'

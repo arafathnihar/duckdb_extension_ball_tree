@@ -14,6 +14,7 @@
 // multiply by the sphere radius to get a length.
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -212,39 +213,192 @@ public:
 		return out;
 	}
 
-	// Radius count for every point in the tree, indexed by point id. Uses `n_threads`
-	// worker threads (0 = hardware concurrency).
+	// Radius count for every point in the tree (the point itself included), indexed by point id.
+	// Uses `n_threads` worker threads (0 = hardware concurrency).
+	//
+	// A dual-tree traversal: each subtree of "query" points is walked against the whole tree, so one
+	// node-node bound settles many point-node questions at once. When every point of a reference node
+	// is within reach of every point of a query node, the count grows by the node's size without
+	// looking at its points. Threads own disjoint query subtrees, so they never write the same count.
 	std::vector<int64_t> CountRadiusAll(double r, size_t n_threads = 0) const {
-		std::vector<int64_t> counts(n_points_);
+		std::vector<int64_t> counts(n_points_, 0);
 		if (n_threads == 0) {
 			n_threads = std::max(1u, std::thread::hardware_concurrency());
 		}
 		n_threads = std::min(n_threads, std::max<size_t>(1, n_points_ / 1024));
+		// node_add[q]: to be added to every point under query node q
+		std::vector<int64_t> node_add(n_nodes_, 0);
+		const std::vector<size_t> tasks = Subtrees(n_threads * 16);
 		const double rr = Haversine::DistToRDist(r);
-		auto work = [&](size_t begin, size_t end) {
-			for (size_t i = begin; i < end; i++) {
-				const int64_t id = idx_array_[i];
-				counts[id] = CountRadiusNode(0, Point(id), r, rr);
+		std::atomic<size_t> next {0};
+		auto work = [&]() {
+			for (size_t t = next++; t < tasks.size(); t = next++) {
+				CountPairsNode(tasks[t], 0, r, rr, counts, node_add);
+				PushDown(tasks[t], node_add, counts);
 			}
 		};
 		if (n_threads <= 1) {
-			work(0, n_points_);
+			work();
 			return counts;
 		}
 		std::vector<std::thread> threads;
-		const size_t chunk = (n_points_ + n_threads - 1) / n_threads;
 		for (size_t t = 0; t < n_threads; t++) {
-			const size_t begin = t * chunk;
-			const size_t end = std::min(n_points_, begin + chunk);
-			if (begin < end) {
-				threads.emplace_back(work, begin, end);
-			}
+			threads.emplace_back(work);
 		}
 		for (auto &th : threads) {
 			th.join();
 		}
 		return counts;
 	}
+
+	//===--------------------------------------------------------------------===//
+	// Self-join: every pair of points within a radius of each other
+	//
+	// A dual-tree traversal (Gray & Moore 2000; Curtin et al. 2013) over pairs of nodes, starting from
+	// (root, root). A pair of distinct nodes is dropped when their balls are too far apart, and otherwise
+	// the larger node is split. A node paired with itself becomes its (left, left), (left, right) and
+	// (right, right) children, so each unordered pair of points is visited exactly once. Leaf pairs, and
+	// pairs of nodes that are entirely within reach of each other, are scanned point by point.
+	//===--------------------------------------------------------------------===//
+
+	// Two nodes whose point pairs are still to be visited: either the same node, or disjoint ones.
+	struct NodePair {
+		size_t a;
+		size_t b;
+	};
+
+	// Splits the self-join at angular radius `r` into at least `min_tasks` independent node pairs where the
+	// tree allows it, biggest first. Together they cover each unordered pair of points exactly once.
+	std::vector<NodePair> SelfJoinTasks(double r, size_t min_tasks) const {
+		std::vector<NodePair> tasks {{0, 0}};
+		bool split = true;
+		while (split && tasks.size() < min_tasks) {
+			split = false;
+			std::vector<NodePair> next;
+			for (const NodePair &task : tasks) {
+				switch (Classify(task, r)) {
+				case Step::PRUNE:
+					break;
+				case Step::SCAN:
+					next.push_back(task);
+					break;
+				case Step::SPLIT: {
+					NodePair children[3];
+					next.insert(next.end(), children, children + Split(task, children));
+					split = true;
+					break;
+				}
+				}
+			}
+			tasks.swap(next);
+		}
+		std::stable_sort(tasks.begin(), tasks.end(),
+		                 [&](const NodePair &x, const NodePair &y) { return PairWork(x) > PairWork(y); });
+		return tasks;
+	}
+
+	// Walks self-join tasks and hands out their pairs a bounded batch at a time. Holds only a stack of
+	// node pairs (O(tree depth)) and a position inside the leaf scan in progress, so it can stop when the
+	// caller's buffer is full and pick up where it left off. Not thread-safe; use one per thread.
+	class SelfJoin {
+	public:
+		SelfJoin(const BallTree &tree, double r) : tree_(tree), r_(r), rr_(Haversine::DistToRDist(r)) {
+		}
+
+		void Start(NodePair task) {
+			stack_.clear();
+			stack_.push_back(Frame {task, false, 0, 0});
+		}
+
+		// Writes up to `max` pairs of the current task (point ids and angular distance) and returns how
+		// many. Returns fewer than `max` only once the task is finished. Each unordered pair appears once,
+		// in no particular orientation.
+		size_t Next(int64_t *ids_a, int64_t *ids_b, double *dists, size_t max) {
+			size_t n = 0;
+			while (n < max && !stack_.empty()) {
+				Frame &frame = stack_.back();
+				if (frame.scanning) {
+					n += Scan(frame, ids_a + n, ids_b + n, dists + n, max - n);
+					if (frame.i == tree_.nodes_[frame.pair.a].idx_end) {
+						stack_.pop_back();
+					}
+					continue;
+				}
+				switch (tree_.Classify(frame.pair, r_)) {
+				case Step::PRUNE:
+					stack_.pop_back();
+					break;
+				case Step::SCAN:
+					frame.scanning = true;
+					frame.i = tree_.nodes_[frame.pair.a].idx_start;
+					frame.j = RowStart(frame);
+					break;
+				case Step::SPLIT: {
+					NodePair children[3];
+					const size_t n_children = tree_.Split(frame.pair, children);
+					stack_.pop_back(); // invalidates `frame`
+					for (size_t c = n_children; c-- > 0;) {
+						stack_.push_back(Frame {children[c], false, 0, 0});
+					}
+					break;
+				}
+				}
+			}
+			return n;
+		}
+
+	private:
+		// A node pair on the stack. Once `scanning`, (i, j) are the next idx_array_ positions to compare.
+		struct Frame {
+			NodePair pair;
+			bool scanning;
+			size_t i;
+			size_t j;
+		};
+
+		// First j to compare with i: the points after i when a node is paired with itself, else all of b.
+		size_t RowStart(const Frame &frame) const {
+			return frame.pair.a == frame.pair.b ? frame.i + 1 : tree_.nodes_[frame.pair.b].idx_start;
+		}
+
+		size_t Scan(Frame &frame, int64_t *ids_a, int64_t *ids_b, double *dists, size_t max) {
+			const Node &node_a = tree_.nodes_[frame.pair.a];
+			const Node &node_b = tree_.nodes_[frame.pair.b];
+			const bool same = frame.pair.a == frame.pair.b;
+			size_t n = 0;
+			for (; frame.i < node_a.idx_end; frame.i++, frame.j = RowStart(frame)) {
+				const int64_t id_a = tree_.idx_array_[frame.i];
+				const double *pt = tree_.Point(id_a);
+				if (!same && frame.j == node_b.idx_start) {
+					// skip a point that is out of reach of all of b
+					double lo, hi;
+					tree_.MinMaxDist(frame.pair.b, pt, lo, hi);
+					if (lo > r_ + BOUND_SLACK) {
+						continue;
+					}
+				}
+				for (; frame.j < node_b.idx_end; frame.j++) {
+					if (n == max) {
+						return n;
+					}
+					const int64_t id_b = tree_.idx_array_[frame.j];
+					const double rd = Haversine::RDist(pt, tree_.Point(id_b));
+					if (rd <= rr_) {
+						ids_a[n] = id_a;
+						ids_b[n] = id_b;
+						dists[n] = Haversine::RDistToDist(rd);
+						n++;
+					}
+				}
+			}
+			return n;
+		}
+
+		const BallTree &tree_;
+		double r_;
+		double rr_;
+		std::vector<Frame> stack_;
+	};
 
 private:
 	BallTree() = default; // for Deserialize
@@ -369,24 +523,157 @@ private:
 		hi = d + nodes_[i_node].radius;
 	}
 
-	int64_t CountRadiusNode(size_t i_node, const double *pt, double r, double rr) const {
-		const Node &node = nodes_[i_node];
+	//===--------------------------------------------------------------------===//
+	// Dual-tree helpers
+	//===--------------------------------------------------------------------===//
+
+	// Node-node bounds are computed from centroids that were themselves rounded, so they are trusted only up
+	// to this much (radians; about 6 micrometres on Earth). Pruning is relaxed and "all within reach" is
+	// tightened by it, so a bound can only cost work, never drop or invent a pair; the leaf scans decide.
+	static constexpr double BOUND_SLACK = 1e-12;
+
+	size_t Count(size_t i_node) const {
+		return nodes_[i_node].idx_end - nodes_[i_node].idx_start;
+	}
+
+	// Lower and upper bounds on the distance between a point of node a and a point of node b.
+	void NodeMinMaxDist(size_t a, size_t b, double &lo, double &hi) const {
+		if (a == b) {
+			lo = 0.0;
+			hi = 2.0 * nodes_[a].radius;
+			return;
+		}
+		const double d = Haversine::Dist(Centroid(a), Centroid(b));
+		lo = std::max(0.0, d - nodes_[a].radius - nodes_[b].radius);
+		hi = d + nodes_[a].radius + nodes_[b].radius;
+	}
+
+	// What to do with a node pair: drop it (too far apart), scan its point pairs (both leaves, or every pair
+	// within reach so there is nothing to prune below), or split it.
+	enum class Step { PRUNE, SCAN, SPLIT };
+
+	Step Classify(const NodePair &pair, double r) const {
 		double lo, hi;
-		MinMaxDist(i_node, pt, lo, hi);
-		if (lo > r) {
-			return 0; // every point in the ball is too far
+		NodeMinMaxDist(pair.a, pair.b, lo, hi);
+		if (lo > r + BOUND_SLACK) {
+			return Step::PRUNE;
 		}
-		if (hi <= r) {
-			return static_cast<int64_t>(node.idx_end - node.idx_start); // every point in the ball is close enough
+		if ((nodes_[pair.a].is_leaf && nodes_[pair.b].is_leaf) || hi + BOUND_SLACK <= r) {
+			return Step::SCAN;
 		}
-		if (node.is_leaf) {
-			int64_t count = 0;
-			for (size_t i = node.idx_start; i < node.idx_end; i++) {
-				count += Haversine::RDist(pt, Point(idx_array_[i])) <= rr;
+		return Step::SPLIT;
+	}
+
+	// Writes the children of a node pair that Classify said to split, and returns how many (2 or 3).
+	size_t Split(const NodePair &pair, NodePair *children) const {
+		if (pair.a == pair.b) {
+			const size_t left = 2 * pair.a + 1, right = left + 1;
+			children[0] = {left, left};
+			children[1] = {left, right};
+			children[2] = {right, right};
+			return 3;
+		}
+		// split the larger ball, unless it is a leaf
+		if (SplitFirst(pair.a, pair.b)) {
+			children[0] = {2 * pair.a + 1, pair.b};
+			children[1] = {2 * pair.a + 2, pair.b};
+		} else {
+			children[0] = {pair.a, 2 * pair.b + 1};
+			children[1] = {pair.a, 2 * pair.b + 2};
+		}
+		return 2;
+	}
+
+	// Whether to split a (rather than b) when descending a pair of nodes that are not both leaves.
+	bool SplitFirst(size_t a, size_t b) const {
+		return !nodes_[a].is_leaf && (nodes_[b].is_leaf || nodes_[a].radius >= nodes_[b].radius);
+	}
+
+	// Point comparisons a node pair costs at most, to schedule big tasks first.
+	double PairWork(const NodePair &pair) const {
+		const double a = static_cast<double>(Count(pair.a));
+		return pair.a == pair.b ? a * a / 2 : a * static_cast<double>(Count(pair.b));
+	}
+
+	// Disjoint subtrees covering every point: nodes from the top of the tree, at least `min_count` of them
+	// where the tree is deep enough.
+	std::vector<size_t> Subtrees(size_t min_count) const {
+		std::vector<size_t> nodes {0};
+		bool split = true;
+		while (split && nodes.size() < min_count) {
+			split = false;
+			std::vector<size_t> next;
+			for (size_t node : nodes) {
+				if (nodes_[node].is_leaf) {
+					next.push_back(node);
+				} else {
+					next.push_back(2 * node + 1);
+					next.push_back(2 * node + 2);
+					split = true;
+				}
 			}
-			return count;
+			nodes.swap(next);
 		}
-		return CountRadiusNode(2 * i_node + 1, pt, r, rr) + CountRadiusNode(2 * i_node + 2, pt, r, rr);
+		return nodes;
+	}
+
+	// Adds to counts[] the neighbours in reference node `ref` of every point in query node `query`.
+	// Writes only counts of points under `query` and node_add of nodes under `query`.
+	void CountPairsNode(size_t query, size_t ref, double r, double rr, std::vector<int64_t> &counts,
+	                    std::vector<int64_t> &node_add) const {
+		double lo, hi;
+		NodeMinMaxDist(query, ref, lo, hi);
+		if (lo > r + BOUND_SLACK) {
+			return;
+		}
+		if (hi + BOUND_SLACK <= r) {
+			node_add[query] += static_cast<int64_t>(Count(ref));
+			return;
+		}
+		const Node &q = nodes_[query];
+		const Node &b = nodes_[ref];
+		if (q.is_leaf && b.is_leaf) {
+			for (size_t i = q.idx_start; i < q.idx_end; i++) {
+				const int64_t id = idx_array_[i];
+				const double *pt = Point(id);
+				double pt_lo, pt_hi;
+				MinMaxDist(ref, pt, pt_lo, pt_hi);
+				if (pt_lo > r + BOUND_SLACK) {
+					continue;
+				}
+				if (pt_hi + BOUND_SLACK <= r) {
+					counts[id] += static_cast<int64_t>(Count(ref));
+					continue;
+				}
+				int64_t count = 0;
+				for (size_t j = b.idx_start; j < b.idx_end; j++) {
+					count += Haversine::RDist(pt, Point(idx_array_[j])) <= rr;
+				}
+				counts[id] += count;
+			}
+			return;
+		}
+		if (SplitFirst(query, ref)) {
+			CountPairsNode(2 * query + 1, ref, r, rr, counts, node_add);
+			CountPairsNode(2 * query + 2, ref, r, rr, counts, node_add);
+		} else {
+			CountPairsNode(query, 2 * ref + 1, r, rr, counts, node_add);
+			CountPairsNode(query, 2 * ref + 2, r, rr, counts, node_add);
+		}
+	}
+
+	// Adds node_add of `i_node` and its descendants to the counts of their points.
+	void PushDown(size_t i_node, std::vector<int64_t> &node_add, std::vector<int64_t> &counts) const {
+		const Node &node = nodes_[i_node];
+		if (node_add[i_node] != 0) {
+			for (size_t i = node.idx_start; i < node.idx_end; i++) {
+				counts[idx_array_[i]] += node_add[i_node];
+			}
+		}
+		if (!node.is_leaf) {
+			PushDown(2 * i_node + 1, node_add, counts);
+			PushDown(2 * i_node + 2, node_add, counts);
+		}
 	}
 
 	void QueryRadiusNode(size_t i_node, const double *pt, double r, double rr, std::vector<int64_t> &ids,
