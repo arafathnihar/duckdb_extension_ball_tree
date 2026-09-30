@@ -34,6 +34,7 @@ The functions take the **index name** and return the matching **row ids**; join 
 | `ball_index_within(index, lat, lon, radius_km)` | `(row_id, distance_km)` for every point within `radius_km` of `(lat, lon)`, nearest first |
 | `ball_index_nearest(index, lat, lon, k)` | `(row_id, distance_km)` for the `k` closest points, nearest first |
 | `ball_index_degree(index, radius_km)` | `(row_id, degree)` for every indexed point: how many other points are within `radius_km` |
+| `ball_index_pairs(index, radius_km [, "symmetric" := true])` | `(row_id_a, row_id_b, distance_km)` for every pair of distinct points within `radius_km` of each other, in no particular order |
 | `ball_index_info()` | one row per BALL_TREE index: point count, pending changes, whether it is stale |
 
 ```sql
@@ -50,6 +51,18 @@ FROM ball_index_within('pts_idx', 40.88, -72.46, 5) w JOIN pts p ON p.rowid = w.
 SELECT p.id, w.distance_km
 FROM ball_index_nearest('pts_idx', 40.88, -72.46, 3) w JOIN pts p ON p.rowid = w.row_id;
 ```
+
+`ball_index_pairs` is a spatial self-join. It never pairs a point with itself (points at identical coordinates are paired with each other, at distance 0). By default each pair comes out in both directions, `(a, b)` and `(b, a)`, so grouping by `row_id_a` gives each point's neighbours: as many rows as its `ball_index_degree`, and none for a point without neighbours. With `"symmetric" := false` each pair comes out once, with `row_id_a < row_id_b`. The quotes are needed because `symmetric` is a reserved word in DuckDB's grammar (`BETWEEN SYMMETRIC`).
+
+```sql
+-- every pair of points closer than 100 m, once each
+SELECT a.id, b.id, p.distance_km
+FROM ball_index_pairs('pts_idx', 0.1, "symmetric" := false) p
+JOIN pts a ON a.rowid = p.row_id_a
+JOIN pts b ON b.rowid = p.row_id_b;
+```
+
+The result can be much larger than the table (tens of millions of rows for 100k points at 20 km). It is streamed and produced in parallel, never held in memory as a whole. Rows come out in no particular order; add `ORDER BY` if order matters.
 
 The query point and radius (or `k`) must be constants; lateral use (`FROM pts p, ball_index_within('i', p.lat, p.lon, 5)`) is not supported.
 
@@ -161,6 +174,29 @@ rank  id        state          sites_within_25km
 5     6209391   Massachusetts  2193
 ```
 
+**Each site's neighbours within 20 km.** `ball_index_pairs` returns two row ids per pair; join each one back to the table. Here, each of the three top-ranked sites and its two best-ranked neighbours:
+
+```sql
+SELECT a.rank, a.id, a.state, b.id AS neighbour_id, b.rank AS neighbour_rank, round(p.distance_km, 1) AS km
+FROM ball_index_pairs('sites_idx', 20) p
+JOIN sites a ON a.rowid = p.row_id_a
+JOIN sites b ON b.rowid = p.row_id_b
+WHERE a.rank <= 3
+QUALIFY row_number() OVER (PARTITION BY a.id ORDER BY b.rank) <= 2
+ORDER BY a.rank, b.rank;
+```
+```
+rank  id        state          neighbour_id  neighbour_rank  km
+1     26164869  Tennessee      33387506      27              11.2
+1     26164869  Tennessee      35231561      4692            10.4
+2     12276242  Massachusetts  6209391       5               15.9
+2     12276242  Massachusetts  24611021      18              16.7
+3     13334326  New York       36405826      20              5.2
+3     13334326  New York       35952271      34              19.8
+```
+
+There are 76,410,654 rows at 20 km (38,205,327 pairs, each in both directions). The planner hashes `sites` and streams the pairs through both joins. At radius 0 the same function finds sites that share coordinates: 164,801 such pairs.
+
 **Changing the data.** The index follows the table. Only changes to the coordinates matter:
 
 ```sql
@@ -219,6 +255,27 @@ The index and the from-scratch function are close here: the index only saves rea
 
 This is where the index pays off: the scan grows linearly with the table (24x slower than the index at 1M points), and the from-scratch function rebuilds a tree on every call.
 
+**All pairs within a radius** (`ball_index_pairs`, `count(*)` over the result), on the 98,311 sites of the [example](#example-good-sites-near-a-place), median of 5 runs. `single` runs one radius query per point, and `dual` (the default) is a dual-tree self-join:
+
+| radius | rows | single | dual | rows with `"symmetric" := false` | single | dual |
+|---|---|---|---|---|---|---|
+| 1 km | 686,038 | 71 ms | 24 ms | 343,019 | 71 ms | 25 ms |
+| 20 km | 76,410,654 | 318 ms | 135 ms | 38,205,327 | 324 ms | 135 ms |
+| 50 km | 269,859,752 | 865 ms | 376 ms | 134,929,876 | 915 ms | 381 ms |
+
+The dual-tree join is 2.3-3x faster. It finds each pair once, from a pair of tree nodes, where the per-point search finds it twice, once from each end. Both return the same rows. On a 5,000-site sample, both match a brute-force SQL haversine self-join exactly at 1, 20 and 50 km, with distances within 1e-11 km.
+
+The neighbour counts behind `ball_index_degree` (and `ball_degree`) use the same dual-tree bounds. On the same 98,311 sites, with the same degrees as before:
+
+| radius | before (one search per point) | dual-tree |
+|---|---|---|
+| 1 km | 72 ms | 37 ms |
+| 20 km | 151 ms | 128 ms |
+| 50 km | 269 ms | 195 ms |
+| 250 km | 278 ms | 185 ms |
+
+The "neighbour count" table above was measured before this change.
+
 **Keeping an index up to date** (1M points):
 
 | | time |
@@ -254,7 +311,7 @@ Outputs:
 make test
 ```
 
-The SQL tests are in `test/sql/`. `ball_tree_index.test` covers the queries, every invalidation rule above, persistence across restarts, recovery from the write-ahead log, expression indexes, and bad input. The tree itself was checked against scikit-learn on 99,907 real points: radius counts at 5, 50 and 500 km match exactly, and k-nearest distances match to within 5e-13 rad.
+The SQL tests are in `test/sql/`. `ball_tree_index.test` covers the queries, every invalidation rule above, persistence across restarts, recovery from the write-ahead log, expression indexes, and bad input. `ball_tree_pairs.test` checks `ball_index_pairs` against a brute-force SQL self-join, `ball_index_degree` and `ball_index_within`, both algorithms against each other, and edge cases (duplicates at radius 0, the whole sphere, the antimeridian and the poles, a stale index, a restart). The tree itself was checked against scikit-learn on 99,907 real points: radius counts at 5, 50 and 500 km match exactly, and k-nearest distances match to within 5e-13 rad.
 
 The test harness checkpoints after every commit; the index tests turn that off (`PRAGMA wal_autocheckpoint`) where they need to observe a stale index.
 
