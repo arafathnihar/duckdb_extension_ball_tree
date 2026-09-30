@@ -171,6 +171,29 @@ public:
 		QueryRadiusNode(0, pt, r, Haversine::DistToRDist(r), ids, dists);
 	}
 
+	// Like QueryRadius around tree point `id`, but without `id` itself. Other points at the same
+	// coordinates are included.
+	void QueryRadiusFrom(size_t id, double r, std::vector<int64_t> &ids, std::vector<double> *dists) const {
+		QueryRadius(Point(static_cast<int64_t>(id)), r, ids, dists);
+		for (size_t i = 0; i < ids.size(); i++) {
+			if (ids[i] == static_cast<int64_t>(id)) {
+				ids[i] = ids.back();
+				ids.pop_back();
+				if (dists) {
+					(*dists)[i] = dists->back();
+					dists->pop_back();
+				}
+				break;
+			}
+		}
+	}
+
+	// The id of the point at position `i` (0 <= i < Size()) in tree order. Points that are close in the
+	// tree are close in this order, so visiting ids in it keeps queries cache-friendly.
+	int64_t IdAt(size_t i) const {
+		return idx_array_[i];
+	}
+
 	// The k points closest to `pt`, nearest first, as (id, angular distance). Includes the
 	// point itself if it is in the tree.
 	std::vector<std::pair<int64_t, double>> QueryKnn(const double *pt, size_t k) const {
